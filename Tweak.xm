@@ -365,8 +365,12 @@ static void SSHHTryLaunchHUDFromController(UIViewController *controller) {
 
 /// Adds a visible diagnostic button to the activation screen.
 /// The button does not hide alerts; it only exposes and logs the existing HUD launch path.
-static void SSHHInstallHUDButtonIfNeeded(UIViewController *controller) {
-    if (!SSHHIsTargetWelcomeController(controller) || controller.view == nil) {
+static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
+    if (!SSHHIsTargetWelcomeController(controllerObject)) {
+        return;
+    }
+    UIViewController *controller = (UIViewController *)controllerObject;
+    if (controller.view == nil) {
         return;
     }
     if (objc_getAssociatedObject(controller, &SSHHHUDButtonKey) != nil) {
