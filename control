@@ -1,0 +1,9 @@
+Package: com.susu.sshh
+Name: sshh
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: Runtime helper for Calculator welcome flow in roothide environments.
+Maintainer: SuSu
+Author: SuSu
+Section: Tweaks
+Depends: mobilesubstrate

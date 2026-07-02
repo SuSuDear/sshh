@@ -1,0 +1,52 @@
+name: Build roothide
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    name: Build roothide package
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install dpkg ldid make xz
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install Theos roothide
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git "$HOME/theos-roothide"
+
+      - name: Install iPhoneOS16.5 SDK
+        run: |
+          git init /tmp/iOS-SDKs
+          cd /tmp/iOS-SDKs
+          git remote add origin https://github.com/xybp888/iOS-SDKs.git
+          git sparse-checkout init --cone
+          git sparse-checkout set iPhoneOS16.5.sdk
+          git fetch --depth=1 --filter=blob:none origin 1b92ff4a8928f582876e1d388d1381c6a0c59eb9
+          git checkout FETCH_HEAD
+          mkdir -p "$HOME/theos-roothide/sdks"
+          rm -rf "$HOME/theos-roothide/sdks/iPhoneOS16.5.sdk"
+          cp -R iPhoneOS16.5.sdk "$HOME/theos-roothide/sdks/"
+
+      - name: Build package
+        run: |
+          source devkit/roothide.sh
+          make --version
+          FINALPACKAGE=1 make clean package
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: roothide-packages
+          path: packages/*.deb
+          if-no-files-found: error
