@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -220,6 +221,176 @@ static void SSHHDumpTargetClass(void) {
     SSHHLog(@"target method count=%u methods=%@", methodCount, methodNames);
 }
 
+
+/// Associated-object keys for the diagnostic HUD launch button and retained target.
+static char SSHHHUDButtonKey;
+static char SSHHHUDButtonTargetKey;
+
+/// Forward declaration used by the button target implementation.
+static void SSHHTryLaunchHUDFromController(UIViewController *controller);
+
+/// Small Objective-C target object retained by the welcome controller.
+/// It lets a normal UIButton call back into our C helper without modifying target classes.
+@interface SSHHHUDButtonTarget : NSObject
+@property (nonatomic, weak) UIViewController *controller;
+@end
+
+@implementation SSHHHUDButtonTarget
+
+/// Button action: run the HUD-entry discovery routine and log every attempted call.
+- (void)sshh_launchHUDButtonTapped:(UIButton *)sender {
+    SSHHLog(@"HUD button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
+    SSHHTryLaunchHUDFromController(self.controller ?: SSHHFindVisibleWelcomeController());
+}
+
+@end
+
+/// Recursively collects visible controllers so we can find already-created Home/HUD objects.
+static void SSHHCollectControllers(UIViewController *controller, NSMutableArray *controllers) {
+    if (controller == nil || controllers == nil || [controllers containsObject:controller]) {
+        return;
+    }
+    [controllers addObject:controller];
+
+    if (controller.presentedViewController != nil) {
+        SSHHCollectControllers(controller.presentedViewController, controllers);
+    }
+    if ([controller isKindOfClass:[UINavigationController class]]) {
+        for (UIViewController *child in ((UINavigationController *)controller).viewControllers) {
+            SSHHCollectControllers(child, controllers);
+        }
+    }
+    if ([controller isKindOfClass:[UITabBarController class]]) {
+        for (UIViewController *child in ((UITabBarController *)controller).viewControllers) {
+            SSHHCollectControllers(child, controllers);
+        }
+    }
+    for (UIViewController *child in controller.childViewControllers) {
+        SSHHCollectControllers(child, controllers);
+    }
+}
+
+/// Attempts a no-argument selector and records whether the object responded.
+/// Critical logic: only call known HUD-entry selectors, never arbitrary runtime names.
+static BOOL SSHHInvokeNoArgIfPossible(id object, SEL selector, NSString *source) {
+    if (object == nil || selector == NULL) {
+        return NO;
+    }
+    if (![object respondsToSelector:selector]) {
+        SSHHLog(@"HUD candidate skip selector=%@ object=%@ source=%@", NSStringFromSelector(selector), SSHHDescribeObject(object), source);
+        return NO;
+    }
+
+    SSHHLog(@"HUD candidate invoke selector=%@ object=%@ source=%@", NSStringFromSelector(selector), SSHHDescribeObject(object), source);
+    @try {
+        // Critical logic: invoke only vetted no-argument HUD entry selectors and keep failures logged.
+        ((void (*)(id, SEL))objc_msgSend)(object, selector);
+        return YES;
+    } @catch (NSException *exception) {
+        SSHHLog(@"HUD candidate exception selector=%@ object=%@ name=%@ reason=%@", NSStringFromSelector(selector), SSHHDescribeObject(object), exception.name, exception.reason);
+        return NO;
+    }
+}
+
+/// Tries all known HUD/start entry selectors on one candidate object.
+static NSUInteger SSHHInvokeHUDSelectorsOnCandidate(id candidate, NSString *source) {
+    NSArray<NSString *> *selectorNames = @[
+        @"startButtonTapped",
+        @"launchExecution",
+        @"setupFloatingBall",
+        @"showFloatingBall"
+    ];
+
+    NSUInteger invoked = 0;
+    for (NSString *selectorName in selectorNames) {
+        if (SSHHInvokeNoArgIfPossible(candidate, NSSelectorFromString(selectorName), source)) {
+            invoked++;
+        }
+    }
+    return invoked;
+}
+
+/// Main HUD discovery routine used by the injected button.
+/// It first tries existing objects, then creates ViewController only as a diagnostic fallback.
+static void SSHHTryLaunchHUDFromController(UIViewController *controller) {
+    SSHHLog(@"HUD discovery start controller=%@", SSHHDescribeObject(controller));
+
+    NSArray<NSString *> *classNames = @[
+        @"ViewController",
+        @"HUDApplication",
+        @"HUDDelegate",
+        @"HUDThread",
+        @"HUDMainWindow",
+        @"DrawRootViewController",
+        @"MenuVC",
+        @"HidVC"
+    ];
+    for (NSString *className in classNames) {
+        SSHHLog(@"HUD class lookup %@ -> %@", className, NSClassFromString(className));
+    }
+
+    NSMutableArray *candidates = [NSMutableArray array];
+    if (controller != nil) {
+        [candidates addObject:controller];
+    }
+    id appDelegate = UIApplication.sharedApplication.delegate;
+    if (appDelegate != nil) {
+        [candidates addObject:appDelegate];
+    }
+
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            SSHHLog(@"HUD window candidate %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
+            SSHHCollectControllers(window.rootViewController, candidates);
+        }
+    }
+
+    NSUInteger invoked = 0;
+    for (id candidate in candidates) {
+        invoked += SSHHInvokeHUDSelectorsOnCandidate(candidate, @"existing-object");
+    }
+
+    Class viewControllerClass = NSClassFromString(@"ViewController");
+    if (viewControllerClass != Nil) {
+        id viewController = [[viewControllerClass alloc] init];
+        SSHHLog(@"HUD instantiated ViewController -> %@", SSHHDescribeObject(viewController));
+        invoked += SSHHInvokeHUDSelectorsOnCandidate(viewController, @"new-ViewController");
+    }
+
+    SSHHLog(@"HUD discovery finished invoked=%lu", (unsigned long)invoked);
+}
+
+/// Adds a visible diagnostic button to the activation screen.
+/// The button does not hide alerts; it only exposes and logs the existing HUD launch path.
+static void SSHHInstallHUDButtonIfNeeded(UIViewController *controller) {
+    if (!SSHHIsTargetWelcomeController(controller) || controller.view == nil) {
+        return;
+    }
+    if (objc_getAssociatedObject(controller, &SSHHHUDButtonKey) != nil) {
+        return;
+    }
+
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.frame = CGRectMake(24.0, 120.0, 160.0, 44.0);
+    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+    button.layer.cornerRadius = 10.0;
+    [button setTitle:@"启动HUD" forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
+    SSHHHUDButtonTarget *target = [SSHHHUDButtonTarget new];
+    target.controller = controller;
+    [button addTarget:target action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    [controller.view addSubview:button];
+    objc_setAssociatedObject(controller, &SSHHHUDButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(controller, &SSHHHUDButtonTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    SSHHLog(@"HUD button installed on %@ button=%@", SSHHDescribeObject(controller), SSHHDescribeObject(button));
+}
+
 %hook TSHWelcomeViewController
 
 /// Preserve original setup, then log and schedule the controlled transition.
@@ -227,6 +398,7 @@ static void SSHHDumpTargetClass(void) {
     SSHHLog(@"TSHWelcomeViewController viewDidLoad self=%@", SSHHDescribeObject(self));
     %orig;
     SSHHScheduleEnterHome(self, "viewDidLoad");
+    SSHHInstallHUDButtonIfNeeded(self);
 }
 
 /// viewDidAppear: is the most reliable point because the controller is on screen.
@@ -234,6 +406,7 @@ static void SSHHDumpTargetClass(void) {
     SSHHLog(@"TSHWelcomeViewController viewDidAppear animated=%@ self=%@", animated ? @"YES" : @"NO", SSHHDescribeObject(self));
     %orig;
     SSHHScheduleEnterHome(self, "viewDidAppear");
+    SSHHInstallHUDButtonIfNeeded(self);
 }
 
 /// Replace the activation poll/check with the already identified final transition.
@@ -287,6 +460,35 @@ static void SSHHDumpTargetClass(void) {
 /// Extra alert lifecycle logging to catch alerts that bypass the generic presenter hook.
 - (void)viewDidAppear:(BOOL)animated {
     SSHHLog(@"UIAlertController viewDidAppear title=%@ message=%@ self=%@", self.title, self.message, SSHHDescribeObject(self));
+    %orig;
+}
+
+%end
+
+
+%hook ViewController
+
+/// Log the original HUD start button handler if the hidden home controller reaches it.
+- (void)startButtonTapped {
+    SSHHLog(@"ViewController startButtonTapped intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+/// Log the lower-level launch method identified from Objective-C metadata.
+- (void)launchExecution {
+    SSHHLog(@"ViewController launchExecution intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+/// Log floating-ball setup because it is likely the visible HUD entry.
+- (void)setupFloatingBall {
+    SSHHLog(@"ViewController setupFloatingBall intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+/// Log floating-ball display to determine whether manual invocation reaches visible UI.
+- (void)showFloatingBall {
+    SSHHLog(@"ViewController showFloatingBall intercepted self=%@", SSHHDescribeObject(self));
     %orig;
 }
 

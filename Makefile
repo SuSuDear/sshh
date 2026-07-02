@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = sshh
 sshh_FILES = Tweak.xm
 sshh_CFLAGS = -fobjc-arc
-sshh_FRAMEWORKS = UIKit Foundation
+sshh_FRAMEWORKS = UIKit Foundation QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
