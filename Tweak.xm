@@ -225,6 +225,10 @@ static void SSHHDumpTargetClass(void) {
 /// Associated-object keys for the diagnostic HUD launch button and retained target.
 static char SSHHHUDButtonKey;
 static char SSHHHUDButtonTargetKey;
+static char SSHHHUDOverlayTargetKey;
+
+/// Retained top-level window so the HUD launch button stays tappable above covered views.
+static UIWindow *SSHHHUDOverlayWindow;
 
 /// Forward declaration used by the button target implementation.
 static void SSHHTryLaunchHUDFromController(UIViewController *controller);
@@ -373,26 +377,76 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     if (controller.view == nil) {
         return;
     }
-    if (objc_getAssociatedObject(controller, &SSHHHUDButtonKey) != nil) {
+
+    if (objc_getAssociatedObject(controller, &SSHHHUDButtonKey) == nil) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        button.frame = CGRectMake(24.0, 120.0, 160.0, 44.0);
+        button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+        button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+        button.layer.cornerRadius = 10.0;
+        [button setTitle:@"启动HUD" forState:UIControlStateNormal];
+        [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
+        SSHHHUDButtonTarget *target = [SSHHHUDButtonTarget new];
+        target.controller = controller;
+        [button addTarget:target action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+        [controller.view addSubview:button];
+        objc_setAssociatedObject(controller, &SSHHHUDButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(controller, &SSHHHUDButtonTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SSHHLog(@"HUD button installed on %@ button=%@", SSHHDescribeObject(controller), SSHHDescribeObject(button));
+    }
+
+    if (SSHHHUDOverlayWindow != nil) {
+        SSHHLog(@"HUD top overlay button already installed window=%@", SSHHDescribeObject(SSHHHUDOverlayWindow));
         return;
     }
 
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.frame = CGRectMake(24.0, 120.0, 160.0, 44.0);
-    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
-    button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
-    button.layer.cornerRadius = 10.0;
-    [button setTitle:@"启动HUD" forState:UIControlStateNormal];
-    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    UIWindowScene *activeWindowScene = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+        activeWindowScene = (UIWindowScene *)scene;
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            break;
+        }
+    }
 
-    SSHHHUDButtonTarget *target = [SSHHHUDButtonTarget new];
-    target.controller = controller;
-    [button addTarget:target action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    CGRect overlayFrame = CGRectMake(24.0, 120.0, 160.0, 44.0);
+    UIWindow *overlayWindow = nil;
+    if (activeWindowScene != nil) {
+        overlayWindow = [[UIWindow alloc] initWithWindowScene:activeWindowScene];
+        overlayWindow.frame = overlayFrame;
+    } else {
+        overlayWindow = [[UIWindow alloc] initWithFrame:overlayFrame];
+    }
 
-    [controller.view addSubview:button];
-    objc_setAssociatedObject(controller, &SSHHHUDButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(controller, &SSHHHUDButtonTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    SSHHLog(@"HUD button installed on %@ button=%@", SSHHDescribeObject(controller), SSHHDescribeObject(button));
+    UIViewController *rootController = [UIViewController new];
+    rootController.view.backgroundColor = UIColor.clearColor;
+    rootController.view.frame = CGRectMake(0.0, 0.0, overlayFrame.size.width, overlayFrame.size.height);
+    overlayWindow.rootViewController = rootController;
+    overlayWindow.backgroundColor = UIColor.clearColor;
+    // Critical logic: keep this tiny window above normal app, alert, and FLEX windows so the button is tappable.
+    overlayWindow.windowLevel = UIWindowLevelAlert + 2000.0;
+    overlayWindow.hidden = NO;
+
+    UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    overlayButton.frame = CGRectMake(0.0, 0.0, overlayFrame.size.width, overlayFrame.size.height);
+    overlayButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlayButton.backgroundColor = [UIColor colorWithRed:0.15 green:0.35 blue:1.0 alpha:0.85];
+    overlayButton.layer.cornerRadius = 10.0;
+    [overlayButton setTitle:@"启动HUD" forState:UIControlStateNormal];
+    [overlayButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
+    SSHHHUDButtonTarget *overlayTarget = [SSHHHUDButtonTarget new];
+    overlayTarget.controller = controller;
+    [overlayButton addTarget:overlayTarget action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [rootController.view addSubview:overlayButton];
+    objc_setAssociatedObject(rootController, &SSHHHUDOverlayTargetKey, overlayTarget, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    SSHHHUDOverlayWindow = overlayWindow;
+    SSHHLog(@"HUD top overlay button installed window=%@ button=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(activeWindowScene));
 }
 
 %hook TSHWelcomeViewController
