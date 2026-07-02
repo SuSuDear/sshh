@@ -11,6 +11,73 @@ static NSString * const SSHHTargetControllerName = @"TSHWelcomeViewController";
 /// Used only for diagnostics and for dismissing the blocking activation prompt.
 static NSString * const SSHHVerificationTitle = @"验证";
 
+/// Primary file log path inside the plugin workspace requested by the operator.
+static NSString * const SSHHPrimaryLogPath = @"/var/mobile/Containers/Shared/AppGroup/.jbroot-6622400836D9B053/var/mobile/SuSu/sshh/sshh.log";
+
+/// Fallback path used if the sandbox cannot write to the workspace path.
+static NSString * const SSHHFallbackLogPath = @"/tmp/sshh.log";
+
+/// Serial queue used to avoid interleaved writes from UIKit callbacks.
+static dispatch_queue_t SSHHLogQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.susu.sshh.filelog", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+/// Appends one diagnostic line to the plugin log file and mirrors it to NSLog.
+/// Critical logic: keep file writes best-effort so diagnostics never block app flow.
+static void SSHHLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void SSHHLog(NSString *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+
+    NSString *line = [NSString stringWithFormat:@"[sshh] %@", message ?: @""];
+    NSLog(@"%@", line);
+
+    dispatch_async(SSHHLogQueue(), ^{
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+        NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+        NSString *entry = [NSString stringWithFormat:@"%@ %@\n", timestamp, line];
+        NSData *data = [entry dataUsingEncoding:NSUTF8StringEncoding];
+
+        NSString *path = SSHHPrimaryLogPath;
+        NSFileManager *fileManager = NSFileManager.defaultManager;
+        NSString *directory = path.stringByDeletingLastPathComponent;
+        BOOL directoryReady = [fileManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+        if (!directoryReady) {
+            path = SSHHFallbackLogPath;
+        }
+
+        if (![fileManager fileExistsAtPath:path]) {
+            [data writeToFile:path atomically:YES];
+            return;
+        }
+
+        NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fileHandle == nil && ![path isEqualToString:SSHHFallbackLogPath]) {
+            path = SSHHFallbackLogPath;
+            if (![fileManager fileExistsAtPath:path]) {
+                [data writeToFile:path atomically:YES];
+                return;
+            }
+            fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
+        }
+
+        if (fileHandle != nil) {
+            [fileHandle seekToEndOfFile];
+            [fileHandle writeData:data];
+            [fileHandle closeFile];
+        }
+    });
+}
+
 /// Builds a stable object description for runtime logs without assuming the object type.
 static NSString *SSHHDescribeObject(id object) {
     if (object == nil) {
@@ -90,26 +157,26 @@ static UIViewController *SSHHFindVisibleWelcomeController(void) {
 /// This keeps the controller's own state consistent before entering Home.
 static void SSHHSetBoolIfPossible(id object, SEL selector, BOOL value) {
     if (object != nil && [object respondsToSelector:selector]) {
-        NSLog(@"[sshh] set %@=%@ on %@", NSStringFromSelector(selector), value ? @"YES" : @"NO", SSHHDescribeObject(object));
+        SSHHLog(@"set %@=%@ on %@", NSStringFromSelector(selector), value ? @"YES" : @"NO", SSHHDescribeObject(object));
         ((void (*)(id, SEL, BOOL))objc_msgSend)(object, selector, value);
     } else {
-        NSLog(@"[sshh] skip setter %@ on %@", NSStringFromSelector(selector), SSHHDescribeObject(object));
+        SSHHLog(@"skip setter %@ on %@", NSStringFromSelector(selector), SSHHDescribeObject(object));
     }
 }
 
 /// Executes the final navigation primitive observed in the target binary.
 /// Critical logic: pass YES to ToHome: so the original method takes the Home path.
 static void SSHHForceEnterHomeNow(id controller, const char *reason) {
-    NSLog(@"[sshh] force request reason=%s controller=%@ targetClass=%@", reason ?: "unknown", SSHHDescribeObject(controller), NSClassFromString(SSHHTargetControllerName));
+    SSHHLog(@"force request reason=%s controller=%@ targetClass=%@", reason ?: "unknown", SSHHDescribeObject(controller), NSClassFromString(SSHHTargetControllerName));
 
     if (!SSHHIsTargetWelcomeController(controller)) {
-        NSLog(@"[sshh] force aborted: controller is not target welcome controller");
+        SSHHLog(@"force aborted: controller is not target welcome controller");
         return;
     }
 
     SEL toHomeSelector = NSSelectorFromString(@"ToHome:");
     if (![controller respondsToSelector:toHomeSelector]) {
-        NSLog(@"[sshh] force aborted: ToHome: unavailable on %@", SSHHDescribeObject(controller));
+        SSHHLog(@"force aborted: ToHome: unavailable on %@", SSHHDescribeObject(controller));
         return;
     }
 
@@ -117,13 +184,13 @@ static void SSHHForceEnterHomeNow(id controller, const char *reason) {
     SSHHSetBoolIfPossible(controller, NSSelectorFromString(@"setTsh_activationStarted:"), YES);
     SSHHSetBoolIfPossible(controller, NSSelectorFromString(@"setTsh_didEnterHome:"), YES);
 
-    NSLog(@"[sshh] calling ToHome:YES reason=%s", reason ?: "unknown");
+    SSHHLog(@"calling ToHome:YES reason=%s", reason ?: "unknown");
     ((void (*)(id, SEL, BOOL))objc_msgSend)(controller, toHomeSelector, YES);
 }
 
 /// Schedules navigation on the main queue after UIKit presentation/layout settles.
 static void SSHHScheduleEnterHome(id controller, const char *reason) {
-    NSLog(@"[sshh] schedule reason=%s controller=%@ isTarget=%@", reason ?: "unknown", SSHHDescribeObject(controller), SSHHIsTargetWelcomeController(controller) ? @"YES" : @"NO");
+    SSHHLog(@"schedule reason=%s controller=%@ isTarget=%@", reason ?: "unknown", SSHHDescribeObject(controller), SSHHIsTargetWelcomeController(controller) ? @"YES" : @"NO");
 
     __weak id weakController = controller;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -135,7 +202,7 @@ static void SSHHScheduleEnterHome(id controller, const char *reason) {
 /// Logs the available methods on the target class so we can confirm runtime names.
 static void SSHHDumpTargetClass(void) {
     Class targetClass = NSClassFromString(SSHHTargetControllerName);
-    NSLog(@"[sshh] target class lookup %@ -> %@", SSHHTargetControllerName, targetClass);
+    SSHHLog(@"target class lookup %@ -> %@", SSHHTargetControllerName, targetClass);
     if (targetClass == Nil) {
         return;
     }
@@ -150,35 +217,35 @@ static void SSHHDumpTargetClass(void) {
         }
     }
     free(methods);
-    NSLog(@"[sshh] target method count=%u methods=%@", methodCount, methodNames);
+    SSHHLog(@"target method count=%u methods=%@", methodCount, methodNames);
 }
 
 %hook TSHWelcomeViewController
 
 /// Preserve original setup, then log and schedule the controlled transition.
 - (void)viewDidLoad {
-    NSLog(@"[sshh] TSHWelcomeViewController viewDidLoad self=%@", SSHHDescribeObject(self));
+    SSHHLog(@"TSHWelcomeViewController viewDidLoad self=%@", SSHHDescribeObject(self));
     %orig;
     SSHHScheduleEnterHome(self, "viewDidLoad");
 }
 
 /// viewDidAppear: is the most reliable point because the controller is on screen.
 - (void)viewDidAppear:(BOOL)animated {
-    NSLog(@"[sshh] TSHWelcomeViewController viewDidAppear animated=%@ self=%@", animated ? @"YES" : @"NO", SSHHDescribeObject(self));
+    SSHHLog(@"TSHWelcomeViewController viewDidAppear animated=%@ self=%@", animated ? @"YES" : @"NO", SSHHDescribeObject(self));
     %orig;
     SSHHScheduleEnterHome(self, "viewDidAppear");
 }
 
 /// Replace the activation poll/check with the already identified final transition.
 - (void)tsh_checkActivationAndEnterHome {
-    NSLog(@"[sshh] tsh_checkActivationAndEnterHome intercepted self=%@", SSHHDescribeObject(self));
+    SSHHLog(@"tsh_checkActivationAndEnterHome intercepted self=%@", SSHHDescribeObject(self));
     SSHHScheduleEnterHome(self, "tsh_checkActivationAndEnterHome");
 }
 
 /// Log all calls into ToHome: and force the original implementation to receive YES.
 /// This directly tests whether the final navigation branch is still being reached.
 - (void)ToHome:(BOOL)enterHome {
-    NSLog(@"[sshh] ToHome: intercepted originalArg=%@ self=%@ -> calling %%orig(YES)", enterHome ? @"YES" : @"NO", SSHHDescribeObject(self));
+    SSHHLog(@"ToHome: intercepted originalArg=%@ self=%@ -> calling %%orig(YES)", enterHome ? @"YES" : @"NO", SSHHDescribeObject(self));
     %orig(YES);
 }
 
@@ -195,13 +262,13 @@ static void SSHHDumpTargetClass(void) {
         UIAlertController *alert = (UIAlertController *)viewControllerToPresent;
         title = alert.title;
         message = alert.message;
-        NSLog(@"[sshh] present UIAlertController title=%@ message=%@ presenter=%@", title, message, SSHHDescribeObject(self));
+        SSHHLog(@"present UIAlertController title=%@ message=%@ presenter=%@", title, message, SSHHDescribeObject(self));
     } else {
-        NSLog(@"[sshh] present controller=%@ presenter=%@", SSHHDescribeObject(viewControllerToPresent), SSHHDescribeObject(self));
+        SSHHLog(@"present controller=%@ presenter=%@", SSHHDescribeObject(viewControllerToPresent), SSHHDescribeObject(self));
     }
 
     if ([title isEqualToString:SSHHVerificationTitle]) {
-        NSLog(@"[sshh] suppressing verification alert and retrying ToHome:YES");
+        SSHHLog(@"suppressing verification alert and retrying ToHome:YES");
         UIViewController *welcomeController = SSHHFindWelcomeControllerFrom(self) ?: SSHHFindVisibleWelcomeController();
         SSHHScheduleEnterHome(welcomeController, "presentVerificationAlert");
         if (completion != nil) {
@@ -219,7 +286,7 @@ static void SSHHDumpTargetClass(void) {
 
 /// Extra alert lifecycle logging to catch alerts that bypass the generic presenter hook.
 - (void)viewDidAppear:(BOOL)animated {
-    NSLog(@"[sshh] UIAlertController viewDidAppear title=%@ message=%@ self=%@", self.title, self.message, SSHHDescribeObject(self));
+    SSHHLog(@"UIAlertController viewDidAppear title=%@ message=%@ self=%@", self.title, self.message, SSHHDescribeObject(self));
     %orig;
 }
 
@@ -228,6 +295,6 @@ static void SSHHDumpTargetClass(void) {
 /// Constructor used for a narrow runtime sanity log.
 %ctor {
     NSBundle *mainBundle = NSBundle.mainBundle;
-    NSLog(@"[sshh] Loaded bundleID=%@ executable=%@ process=%@", mainBundle.bundleIdentifier, mainBundle.executablePath.lastPathComponent, NSProcessInfo.processInfo.processName);
+    SSHHLog(@"Loaded bundleID=%@ executable=%@ process=%@", mainBundle.bundleIdentifier, mainBundle.executablePath.lastPathComponent, NSProcessInfo.processInfo.processName);
     SSHHDumpTargetClass();
 }
