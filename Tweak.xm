@@ -12,8 +12,8 @@ static NSString * const SSHHTargetControllerName = @"TSHWelcomeViewController";
 /// Used only for diagnostics and for dismissing the blocking activation prompt.
 static NSString * const SSHHVerificationTitle = @"验证";
 
-/// Primary file log path inside the plugin workspace requested by the operator.
-static NSString * const SSHHPrimaryLogPath = @"/var/mobile/Containers/Shared/AppGroup/.jbroot-6622400836D9B053/var/mobile/SuSu/sshh/sshh.log";
+/// Primary file log path under a stable mobile-owned directory that survives jbroot path changes.
+static NSString * const SSHHPrimaryLogPath = @"/var/mobile/SuSu/sshh.log";
 
 /// Fallback path used if the sandbox cannot write to the workspace path.
 static NSString * const SSHHFallbackLogPath = @"/tmp/sshh.log";
@@ -227,11 +227,17 @@ static char SSHHHUDButtonKey;
 static char SSHHHUDButtonTargetKey;
 static char SSHHHUDOverlayTargetKey;
 
-/// Retained top-level window so the HUD launch button stays tappable above covered views.
+/// Retained top-level window so diagnostic controls stay visible without covering the HUD.
 static UIWindow *SSHHHUDOverlayWindow;
 
-/// Forward declaration used by the button target implementation.
+/// Forward declaration for the passthrough window that only captures touches on real controls.
+@interface SSHHPassthroughWindow : UIWindow
+@end
+
+/// Forward declarations used by the overlay button target implementation.
 static void SSHHTryLaunchHUDFromController(UIViewController *controller);
+static void SSHHTryCloseDrawingFromController(UIViewController *controller);
+static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 
 /// Small Objective-C target object retained by the welcome controller.
 /// It lets a normal UIButton call back into our C helper without modifying target classes.
@@ -245,6 +251,27 @@ static void SSHHTryLaunchHUDFromController(UIViewController *controller);
 - (void)sshh_launchHUDButtonTapped:(UIButton *)sender {
     SSHHLog(@"HUD button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
     SSHHTryLaunchHUDFromController(self.controller ?: SSHHFindVisibleWelcomeController());
+    // Critical logic: after launching HUD, hide the start button so it cannot block HUD drag/tap gestures.
+    SSHHSetOverlayStartButtonHidden(YES);
+}
+
+/// Button action: trigger the app's own close-drawing button when it exists in the live view tree.
+- (void)sshh_closeDrawingButtonTapped:(UIButton *)sender {
+    SSHHLog(@"close drawing button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
+    SSHHTryCloseDrawingFromController(self.controller ?: SSHHFindVisibleWelcomeController());
+}
+
+@end
+
+@implementation SSHHPassthroughWindow
+
+/// Return nil for transparent background hits so HUD windows below can still receive taps and pans.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    if (hitView == self || hitView == self.rootViewController.view) {
+        return nil;
+    }
+    return hitView;
 }
 
 @end
@@ -367,6 +394,67 @@ static void SSHHTryLaunchHUDFromController(UIViewController *controller) {
     SSHHLog(@"HUD discovery finished invoked=%lu", (unsigned long)invoked);
 }
 
+/// Recursively scans subviews for buttons matching a visible title.
+static void SSHHCollectButtonsMatchingTitle(UIView *view, NSString *needle, NSMutableArray<UIButton *> *matches) {
+    if (view == nil || needle.length == 0 || matches == nil) {
+        return;
+    }
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *button = (UIButton *)view;
+        NSString *title = button.currentTitle ?: [button titleForState:UIControlStateNormal];
+        if ([title containsString:needle]) {
+            [matches addObject:button];
+            SSHHLog(@"matched button title=%@ button=%@", title, SSHHDescribeObject(button));
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        SSHHCollectButtonsMatchingTitle(subview, needle, matches);
+    }
+}
+
+/// Hides or shows the overlay start button by title, leaving the close-drawing button available.
+static void SSHHSetOverlayStartButtonHidden(BOOL hidden) {
+    if (SSHHHUDOverlayWindow == nil) {
+        return;
+    }
+    NSMutableArray<UIButton *> *matches = [NSMutableArray array];
+    SSHHCollectButtonsMatchingTitle(SSHHHUDOverlayWindow.rootViewController.view, @"启动HUD", matches);
+    for (UIButton *button in matches) {
+        button.hidden = hidden;
+        SSHHLog(@"set overlay start button hidden=%@ button=%@", hidden ? @"YES" : @"NO", SSHHDescribeObject(button));
+    }
+}
+
+/// Tries to close drawing through the app's own visible button rather than guessing private state.
+static void SSHHTryCloseDrawingFromController(UIViewController *controller) {
+    SSHHLog(@"close drawing discovery start controller=%@", SSHHDescribeObject(controller));
+
+    NSMutableArray<UIButton *> *matches = [NSMutableArray array];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            SSHHLog(@"close drawing window candidate %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
+            // Critical logic: skip our diagnostic overlay so we do not recursively tap our own close button.
+            if (window == SSHHHUDOverlayWindow) {
+                continue;
+            }
+            SSHHCollectButtonsMatchingTitle(window, @"关闭绘制", matches);
+        }
+    }
+
+    if (matches.count == 0) {
+        SSHHLog(@"close drawing failed: no visible button titled 关闭绘制 was found");
+        return;
+    }
+
+    for (UIButton *button in matches) {
+        SSHHLog(@"close drawing invoking original button=%@ title=%@", SSHHDescribeObject(button), button.currentTitle ?: [button titleForState:UIControlStateNormal]);
+        [button sendActionsForControlEvents:UIControlEventTouchUpInside];
+    }
+}
+
 /// Adds a visible diagnostic button to the activation screen.
 /// The button does not hide alerts; it only exposes and logs the existing HUD launch path.
 static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
@@ -413,13 +501,13 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
         }
     }
 
-    CGRect overlayFrame = CGRectMake(24.0, 120.0, 160.0, 44.0);
+    CGRect overlayFrame = CGRectMake(24.0, 80.0, 160.0, 96.0);
     UIWindow *overlayWindow = nil;
     if (activeWindowScene != nil) {
-        overlayWindow = [[UIWindow alloc] initWithWindowScene:activeWindowScene];
+        overlayWindow = [[SSHHPassthroughWindow alloc] initWithWindowScene:activeWindowScene];
         overlayWindow.frame = overlayFrame;
     } else {
-        overlayWindow = [[UIWindow alloc] initWithFrame:overlayFrame];
+        overlayWindow = [[SSHHPassthroughWindow alloc] initWithFrame:overlayFrame];
     }
 
     UIViewController *rootController = [UIViewController new];
@@ -432,21 +520,31 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     overlayWindow.hidden = NO;
 
     UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    overlayButton.frame = CGRectMake(0.0, 0.0, overlayFrame.size.width, overlayFrame.size.height);
-    overlayButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlayButton.frame = CGRectMake(0.0, 0.0, overlayFrame.size.width, 44.0);
+    overlayButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
     overlayButton.backgroundColor = [UIColor colorWithRed:0.15 green:0.35 blue:1.0 alpha:0.85];
     overlayButton.layer.cornerRadius = 10.0;
     [overlayButton setTitle:@"启动HUD" forState:UIControlStateNormal];
     [overlayButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
 
+    UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeButton.frame = CGRectMake(0.0, 52.0, overlayFrame.size.width, 44.0);
+    closeButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    closeButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.15 blue:0.15 alpha:0.85];
+    closeButton.layer.cornerRadius = 10.0;
+    [closeButton setTitle:@"关闭绘制" forState:UIControlStateNormal];
+    [closeButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
     SSHHHUDButtonTarget *overlayTarget = [SSHHHUDButtonTarget new];
     overlayTarget.controller = controller;
     [overlayButton addTarget:overlayTarget action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [closeButton addTarget:overlayTarget action:@selector(sshh_closeDrawingButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [rootController.view addSubview:overlayButton];
+    [rootController.view addSubview:closeButton];
     objc_setAssociatedObject(rootController, &SSHHHUDOverlayTargetKey, overlayTarget, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     SSHHHUDOverlayWindow = overlayWindow;
-    SSHHLog(@"HUD top overlay button installed window=%@ button=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(activeWindowScene));
+    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ closeButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(activeWindowScene));
 }
 
 %hook TSHWelcomeViewController
