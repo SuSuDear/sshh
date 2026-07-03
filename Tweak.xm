@@ -254,6 +254,9 @@ static UIWindow *SSHHHUDOverlayWindow;
 
 /// Forward declarations used by the overlay button target implementation.
 static void SSHHTryLaunchHUDFromController(UIViewController *controller);
+static id SSHHObjectIvarIfPresent(id object, const char *ivarName);
+static NSArray<UIWindow *> *SSHHAllRuntimeWindows(void);
+static NSUInteger SSHHRestoreFloatingBallFromRuntime(UIViewController *controller, const char *reason);
 static void SSHHTryCloseDrawingFromController(UIViewController *controller);
 static void SSHHTryToggleLiveModeFromController(UIViewController *controller);
 static void SSHHTryCloseLogFromRuntime(UIViewController *controller);
@@ -272,9 +275,11 @@ static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 /// Button action: run the HUD-entry discovery routine and log every attempted call.
 - (void)sshh_launchHUDButtonTapped:(UIButton *)sender {
     SSHHLog(@"HUD button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
-    SSHHTryLaunchHUDFromController(self.controller ?: SSHHFindVisibleWelcomeController());
-    // Critical logic: after launching HUD, hide the start button so it cannot block HUD drag/tap gestures.
-    SSHHSetOverlayStartButtonHidden(YES);
+    UIViewController *controller = self.controller ?: SSHHFindVisibleWelcomeController();
+    SSHHTryLaunchHUDFromController(controller);
+    NSUInteger restored = SSHHRestoreFloatingBallFromRuntime(controller, "launchButtonTapped");
+    // Critical logic: hide our start button only when the original floating ball/window was actually restored.
+    SSHHSetOverlayStartButtonHidden(restored > 0);
 }
 
 /// Button action: trigger the app's own close-drawing handler when it exists in the live view tree.
@@ -519,6 +524,97 @@ static NSUInteger SSHHInvokeKnownObjectAction(NSArray *candidates, NSString *sel
         }
     }
     return invoked;
+}
+
+
+/// Restores visibility for a view that may be the original square/circle floating ball.
+static BOOL SSHHRestoreFloatingView(UIView *view, NSString *source) {
+    if (![view isKindOfClass:[UIView class]]) {
+        return NO;
+    }
+    CGRect frame = view.frame;
+    SSHHLog(@"restore floating view source=%@ view=%@ class=%@ frame={%.1f,%.1f,%.1f,%.1f} hidden=%@ alpha=%.2f super=%@ window=%@", source, SSHHDescribeObject(view), NSStringFromClass([view class]), frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, view.hidden ? @"YES" : @"NO", view.alpha, SSHHDescribeObject(view.superview), SSHHDescribeObject(view.window));
+    /// Critical logic: restore only visibility/interaction; keep the app's own layout and gestures intact.
+    view.hidden = NO;
+    view.alpha = 1.0;
+    view.userInteractionEnabled = YES;
+    if (view.superview != nil) {
+        [view.superview bringSubviewToFront:view];
+    }
+    return YES;
+}
+
+/// Restores HUDMainWindow / HUDDelegate.hudwindow so the floating ball can appear above other apps.
+static BOOL SSHHRestoreHUDWindow(UIWindow *window, NSString *source) {
+    if (![window isKindOfClass:[UIWindow class]] || window == SSHHHUDOverlayWindow) {
+        return NO;
+    }
+    NSString *windowClass = NSStringFromClass([window class]);
+    NSString *rootClass = NSStringFromClass([window.rootViewController class]);
+    BOOL isHUDWindow = [windowClass containsString:@"HUDMainWindow"] || [rootClass containsString:@"ViewController"] || [rootClass containsString:@"MenuVC"];
+    if (!isHUDWindow) {
+        return NO;
+    }
+    SSHHLog(@"restore HUD window source=%@ window=%@ class=%@ root=%@ level=%.1f hidden=%@ alpha=%.2f", source, SSHHDescribeObject(window), windowClass, SSHHDescribeObject(window.rootViewController), window.windowLevel, window.hidden ? @"YES" : @"NO", window.alpha);
+    /// Critical logic: the floating button is rendered in a high-level HUD window, so restore the window itself first.
+    window.hidden = NO;
+    window.alpha = 1.0;
+    window.userInteractionEnabled = YES;
+    if (window.windowLevel < UIWindowLevelAlert + 1000.0) {
+        window.windowLevel = UIWindowLevelAlert + 1500.0;
+    }
+    [window makeKeyAndVisible];
+    return YES;
+}
+
+/// Re-enables the target's original floating ball after setup/show selectors run.
+static NSUInteger SSHHRestoreFloatingBallFromRuntime(UIViewController *controller, const char *reason) {
+    NSString *source = [NSString stringWithFormat:@"%s", reason ?: "unknown"];
+    NSUInteger restored = 0;
+
+    /// Critical logic: enable the persisted switch used by the original floating-ball path.
+    [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"FloatingBall_key"];
+    [NSUserDefaults.standardUserDefaults synchronize];
+
+    id appDelegate = UIApplication.sharedApplication.delegate;
+    SEL hudWindowSelector = NSSelectorFromString(@"hudwindow");
+    if (appDelegate != nil && [appDelegate respondsToSelector:hudWindowSelector]) {
+        UIWindow *hudWindow = ((UIWindow *(*)(id, SEL))objc_msgSend)(appDelegate, hudWindowSelector);
+        if (SSHHRestoreHUDWindow(hudWindow, [source stringByAppendingString:@":delegate.hudwindow"])) {
+            restored++;
+        }
+    }
+    UIWindow *ivarHUDWindow = SSHHObjectIvarIfPresent(appDelegate, "_hudwindow");
+    if (SSHHRestoreHUDWindow(ivarHUDWindow, [source stringByAppendingString:@":delegate._hudwindow"])) {
+        restored++;
+    }
+
+    NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
+    for (id candidate in candidates) {
+        SEL floatingSelector = NSSelectorFromString(@"floatingBall");
+        if ([candidate respondsToSelector:floatingSelector]) {
+            UIView *floatingBall = ((UIView *(*)(id, SEL))objc_msgSend)(candidate, floatingSelector);
+            if (SSHHRestoreFloatingView(floatingBall, [source stringByAppendingString:@":candidate.floatingBall"])) {
+                restored++;
+            }
+        }
+        Ivar ivar = class_getInstanceVariable([candidate class], "floatingBall");
+        if (ivar != NULL) {
+            UIView *floatingBall = object_getIvar(candidate, ivar);
+            if (SSHHRestoreFloatingView(floatingBall, [source stringByAppendingString:@":candidate.ivarFloatingBall"])) {
+                restored++;
+            }
+        }
+    }
+
+    for (UIWindow *window in SSHHAllRuntimeWindows()) {
+        if (SSHHRestoreHUDWindow(window, [source stringByAppendingString:@":window-scan"])) {
+            restored++;
+        }
+    }
+
+    SSHHLog(@"restore floating ball finished reason=%@ restored=%lu", source, (unsigned long)restored);
+    return restored;
 }
 
 
@@ -1164,12 +1260,14 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 - (void)setupFloatingBall {
     SSHHLog(@"ViewController setupFloatingBall intercepted self=%@", SSHHDescribeObject(self));
     %orig;
+    SSHHRestoreFloatingBallFromRuntime((UIViewController *)self, "setupFloatingBall");
 }
 
 /// Log floating-ball display to determine whether manual invocation reaches visible UI.
 - (void)showFloatingBall {
     SSHHLog(@"ViewController showFloatingBall intercepted self=%@", SSHHDescribeObject(self));
     %orig;
+    SSHHRestoreFloatingBallFromRuntime((UIViewController *)self, "showFloatingBall");
 }
 
 %end
