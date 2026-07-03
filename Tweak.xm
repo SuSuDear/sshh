@@ -463,7 +463,13 @@ static NSArray *SSHHCollectRuntimeCandidates(UIViewController *controller) {
             SSHHCollectControllers(window.rootViewController, candidates);
         }
     }
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+    SEL appWindowsSelector = NSSelectorFromString(@"windows");
+    NSArray<UIWindow *> *legacyWindows = nil;
+    if ([UIApplication.sharedApplication respondsToSelector:appWindowsSelector]) {
+        /// Critical logic: call deprecated UIApplication.windows through objc_msgSend to keep legacy/high-level HUD windows reachable without tripping SDK -Werror.
+        legacyWindows = ((NSArray<UIWindow *> *(*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, appWindowsSelector);
+    }
+    for (UIWindow *window in legacyWindows) {
         if (window == SSHHHUDOverlayWindow) {
             continue;
         }
