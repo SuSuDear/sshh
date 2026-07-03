@@ -240,6 +240,7 @@ static char SSHHHUDButtonKey;
 static char SSHHHUDButtonTargetKey;
 static char SSHHHUDOverlayTargetKey;
 static char SSHHLogCloseButtonKey;
+static char SSHHLoggedCompletionKey;
 
 /// Retained top-level window so diagnostic controls stay visible without covering the HUD.
 static UIWindow *SSHHHUDOverlayWindow;
@@ -513,6 +514,88 @@ static NSUInteger SSHHInvokeKnownObjectAction(NSArray *candidates, NSString *sel
     return invoked;
 }
 
+
+/// Returns the live LogViewController using the app's HUDDelegate.logVC first, then falls back to window traversal.
+/// Critical logic: the log panel is owned by HUDDelegate._logwindow, so ordinary scene windows may miss it.
+static id SSHHFindLogControllerFromRuntime(UIViewController *controller) {
+    SEL logVCSelector = NSSelectorFromString(@"logVC");
+    id appDelegate = UIApplication.sharedApplication.delegate;
+    if (appDelegate != nil && [appDelegate respondsToSelector:logVCSelector]) {
+        id logController = ((id (*)(id, SEL))objc_msgSend)(appDelegate, logVCSelector);
+        SSHHLog(@"log controller via appDelegate.logVC appDelegate=%@ logVC=%@", SSHHDescribeObject(appDelegate), SSHHDescribeObject(logController));
+        if (logController != nil) {
+            return logController;
+        }
+    }
+
+    NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
+    Class logClass = NSClassFromString(@"LogViewController");
+    for (id candidate in candidates) {
+        if (logClass != Nil && [candidate isKindOfClass:logClass]) {
+            SSHHLog(@"log controller via runtime candidate=%@", SSHHDescribeObject(candidate));
+            return candidate;
+        }
+        if ([candidate respondsToSelector:logVCSelector]) {
+            id logController = ((id (*)(id, SEL))objc_msgSend)(candidate, logVCSelector);
+            SSHHLog(@"log controller via candidate.logVC candidate=%@ logVC=%@", SSHHDescribeObject(candidate), SSHHDescribeObject(logController));
+            if (logController != nil) {
+                return logController;
+            }
+        }
+    }
+    return nil;
+}
+
+/// Enables the original LogViewController close path and keeps close controls above the secure/log text views.
+/// Critical logic: do not create new state; only force the recovered canCloseLogPanel property and revive existing closeButton.
+static void SSHHConfigureLogPanelForTouch(id logController, const char *reason) {
+    if (logController == nil) {
+        SSHHLog(@"configure log panel skipped reason=%s logController=<nil>", reason ?: "unknown");
+        return;
+    }
+
+    SSHHLog(@"configure log panel reason=%s controller=%@", reason ?: "unknown", SSHHDescribeObject(logController));
+    SSHHSetBoolIfPossible(logController, NSSelectorFromString(@"setCanCloseLogPanel:"), YES);
+
+    UIViewController *viewController = [logController isKindOfClass:[UIViewController class]] ? (UIViewController *)logController : nil;
+    UIView *rootView = viewController.view;
+    SEL closeButtonSelector = NSSelectorFromString(@"closeButton");
+    if (rootView != nil && [logController respondsToSelector:closeButtonSelector]) {
+        UIButton *closeButton = ((UIButton *(*)(id, SEL))objc_msgSend)(logController, closeButtonSelector);
+        SSHHLog(@"original log closeButton=%@ superview=%@ hidden=%@ alpha=%.3f userInteraction=%@", SSHHDescribeObject(closeButton), SSHHDescribeObject(closeButton.superview), closeButton.hidden ? @"YES" : @"NO", closeButton.alpha, closeButton.userInteractionEnabled ? @"YES" : @"NO");
+        if ([closeButton isKindOfClass:[UIButton class]]) {
+            closeButton.hidden = NO;
+            closeButton.alpha = 1.0;
+            closeButton.userInteractionEnabled = YES;
+            closeButton.exclusiveTouch = NO;
+            [closeButton addTarget:logController action:@selector(closePage) forControlEvents:UIControlEventTouchUpInside];
+            [rootView bringSubviewToFront:closeButton];
+        }
+    }
+
+    UIView *associatedButton = objc_getAssociatedObject(logController, &SSHHLogCloseButtonKey);
+    if (associatedButton != nil && rootView != nil) {
+        associatedButton.hidden = NO;
+        associatedButton.userInteractionEnabled = YES;
+        [rootView bringSubviewToFront:associatedButton];
+        SSHHLog(@"emergency log close button raised button=%@", SSHHDescribeObject(associatedButton));
+    }
+}
+
+/// Logs a compact body preview for activation/network responses without dumping large binary data.
+static NSString *SSHHBodyPreview(NSData *data) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0) {
+        return @"";
+    }
+    NSUInteger length = MIN((NSUInteger)1024, data.length);
+    NSData *prefix = [data subdataWithRange:NSMakeRange(0, length)];
+    NSString *text = [[NSString alloc] initWithData:prefix encoding:NSUTF8StringEncoding];
+    if (text.length == 0) {
+        text = [prefix base64EncodedStringWithOptions:0];
+    }
+    return text ?: @"";
+}
+
 /// Hides or shows the overlay start button by title, leaving the close-drawing button available.
 static void SSHHSetOverlayStartButtonHidden(BOOL hidden) {
     if (SSHHHUDOverlayWindow == nil) {
@@ -587,6 +670,21 @@ static void SSHHTryToggleLiveModeFromController(UIViewController *controller) {
 /// Closes the log floating panel from our app-level controls by invoking the recovered closePage action.
 static void SSHHTryCloseLogFromRuntime(UIViewController *controller) {
     SSHHLog(@"close log discovery start controller=%@", SSHHDescribeObject(controller));
+
+    id logController = SSHHFindLogControllerFromRuntime(controller);
+    if (logController != nil && [logController respondsToSelector:@selector(closePage)]) {
+        SSHHConfigureLogPanelForTouch(logController, "appOverlayClose");
+        SSHHLog(@"close log invoking delegate/runtime logController.closePage object=%@", SSHHDescribeObject(logController));
+        @try {
+            /// Critical logic: prefer HUDDelegate.logVC.closePage because the log window is not always reachable from scene.windows.
+            ((void (*)(id, SEL))objc_msgSend)(logController, @selector(closePage));
+            SSHHLog(@"close log finished via direct logController.closePage");
+            return;
+        } @catch (NSException *exception) {
+            SSHHLog(@"close log direct closePage exception object=%@ name=%@ reason=%@", SSHHDescribeObject(logController), exception.name, exception.reason);
+        }
+    }
+
     NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
     NSUInteger invoked = SSHHInvokeKnownNoArgAction(candidates, @"closePage", @"close log");
     if (invoked > 0) {
@@ -797,36 +895,140 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     return YES;
 }
 
-/// Log the original close path; the injected fallback button invokes this selector when available.
+/// Keep the backing ivar/property enabled even if original code tries to disable the close panel.
+- (void)setCanCloseLogPanel:(BOOL)enabled {
+    SSHHLog(@"LogViewController setCanCloseLogPanel intercepted original=%@ self=%@ -> YES", enabled ? @"YES" : @"NO", SSHHDescribeObject(self));
+    %orig(YES);
+}
+
+/// Log and preserve the original close path; both original and injected buttons invoke this selector.
 - (void)closePage {
     SSHHLog(@"LogViewController closePage intercepted self=%@", SSHHDescribeObject(self));
+    SSHHConfigureLogPanelForTouch(self, "beforeClosePage");
     %orig;
+}
+
+/// Bypass the panel's button-area filter while logging the original answer for evidence.
+- (BOOL)isTouchInButtonArea:(CGPoint)point {
+    BOOL originalResult = %orig(point);
+    SSHHLog(@"LogViewController isTouchInButtonArea point={%.1f, %.1f} original=%@ self=%@ -> YES", point.x, point.y, originalResult ? @"YES" : @"NO", SSHHDescribeObject(self));
+    /// Critical logic: return YES so touches on revived/injected close buttons are not rejected by the panel filter.
+    return YES;
+}
+
+/// Prevent pan/scroll gestures from stealing touches that land on UIButtons or their labels.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    UIView *touchedView = touch.view;
+    BOOL touchesButton = NO;
+    for (UIView *view = touchedView; view != nil; view = view.superview) {
+        if ([view isKindOfClass:[UIButton class]]) {
+            touchesButton = YES;
+            break;
+        }
+    }
+    if (touchesButton) {
+        SSHHLog(@"LogViewController gesture %@ shouldReceiveTouch button-view=%@ -> NO", SSHHDescribeObject(gestureRecognizer), SSHHDescribeObject(touchedView));
+        /// Critical logic: returning NO lets UIButton receive TouchUpInside instead of the panel pan/scroll gesture.
+        return NO;
+    }
+    BOOL result = %orig(gestureRecognizer, touch);
+    SSHHLog(@"LogViewController gesture %@ shouldReceiveTouch view=%@ original=%@", SSHHDescribeObject(gestureRecognizer), SSHHDescribeObject(touchedView), result ? @"YES" : @"NO");
+    return result;
+}
+
+/// Log hit-testing on the root log view to prove whether the close buttons are under a secure/text overlay.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *result = %orig(point, event);
+    SSHHLog(@"LogViewController hitTest point={%.1f, %.1f} result=%@ self=%@", point.x, point.y, SSHHDescribeObject(result), SSHHDescribeObject(self));
+    return result;
 }
 
 /// Add a small emergency close button above the log panel in case the original close control is hidden by window level.
 - (void)viewDidAppear:(BOOL)animated {
     SSHHLog(@"LogViewController viewDidAppear animated=%@ self=%@", animated ? @"YES" : @"NO", SSHHDescribeObject(self));
     %orig;
+    SSHHConfigureLogPanelForTouch(self, "viewDidAppear");
     UIViewController *controller = (UIViewController *)self;
     if (controller.view == nil || objc_getAssociatedObject(self, &SSHHLogCloseButtonKey) != nil) {
         return;
     }
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.frame = CGRectMake(24.0, 44.0, 120.0, 40.0);
+    button.frame = CGRectMake(24.0, 44.0, 136.0, 44.0);
     button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
     button.backgroundColor = [UIColor colorWithRed:0.8 green:0.1 blue:0.1 alpha:0.9];
     button.layer.cornerRadius = 8.0;
+    button.userInteractionEnabled = YES;
+    button.exclusiveTouch = NO;
     [button setTitle:@"关闭日志" forState:UIControlStateNormal];
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    // Critical logic: call the app's recovered closePage action directly; no private state is modified here.
+    /// Critical logic: call the app's recovered closePage action directly; no private state is modified here.
     [button addTarget:self action:@selector(closePage) forControlEvents:UIControlEventTouchUpInside];
     [controller.view addSubview:button];
+    [controller.view bringSubviewToFront:button];
     objc_setAssociatedObject(self, &SSHHLogCloseButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     SSHHLog(@"LogViewController emergency close button installed button=%@", SSHHDescribeObject(button));
 }
 
 %end
 
+
+
+%hook NSURL
+
+/// Log activation/network URL construction so split or runtime-built domains become visible.
++ (instancetype)URLWithString:(NSString *)URLString {
+    if ([URLString containsString:@"http"] || [URLString containsString:@"banxia"] || [URLString containsString:@".cc"]) {
+        SSHHLog(@"NSURL URLWithString: %@", URLString);
+    }
+    return %orig;
+}
+
+%end
+
+%hook NSURLSession
+
+/// Wrap URL-based tasks to log request URL and response body preview from activation checks.
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    SSHHLog(@"NSURLSession dataTaskWithURL url=%@ completion=%@", url.absoluteString, completionHandler ? @"YES" : @"NO");
+    void (^wrappedCompletion)(NSData *, NSURLResponse *, NSError *) = completionHandler;
+    if (completionHandler != nil && objc_getAssociatedObject(completionHandler, &SSHHLoggedCompletionKey) == nil) {
+        wrappedCompletion = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSInteger statusCode = [response respondsToSelector:@selector(statusCode)] ? ((NSInteger (*)(id, SEL))objc_msgSend)(response, @selector(statusCode)) : -1;
+            SSHHLog(@"NSURLSession dataTaskWithURL completion url=%@ status=%ld error=%@ bytes=%lu body=%@", url.absoluteString, (long)statusCode, error, (unsigned long)data.length, SSHHBodyPreview(data));
+            completionHandler(data, response, error);
+        };
+        objc_setAssociatedObject(wrappedCompletion, &SSHHLoggedCompletionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return %orig(url, wrappedCompletion);
+}
+
+/// Wrap request-based tasks as a fallback for activation checks that use NSMutableURLRequest.
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    SSHHLog(@"NSURLSession dataTaskWithRequest url=%@ method=%@ completion=%@", request.URL.absoluteString, request.HTTPMethod, completionHandler ? @"YES" : @"NO");
+    void (^wrappedCompletion)(NSData *, NSURLResponse *, NSError *) = completionHandler;
+    if (completionHandler != nil && objc_getAssociatedObject(completionHandler, &SSHHLoggedCompletionKey) == nil) {
+        wrappedCompletion = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSInteger statusCode = [response respondsToSelector:@selector(statusCode)] ? ((NSInteger (*)(id, SEL))objc_msgSend)(response, @selector(statusCode)) : -1;
+            SSHHLog(@"NSURLSession dataTaskWithRequest completion url=%@ status=%ld error=%@ bytes=%lu body=%@", request.URL.absoluteString, (long)statusCode, error, (unsigned long)data.length, SSHHBodyPreview(data));
+            completionHandler(data, response, error);
+        };
+        objc_setAssociatedObject(wrappedCompletion, &SSHHLoggedCompletionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return %orig(request, wrappedCompletion);
+}
+
+%end
+
+%hook NSJSONSerialization
+
+/// Log decoded JSON from activation responses so the success/error schema is visible before deciding a spoof point.
++ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
+    id object = %orig(data, opt, error);
+    SSHHLog(@"NSJSONSerialization JSONObjectWithData bytes=%lu object=%@ error=%@ preview=%@", (unsigned long)data.length, object, error ? *error : nil, SSHHBodyPreview(data));
+    return object;
+}
+
+%end
 
 %hook ViewController
 
