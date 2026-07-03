@@ -1,0 +1,346 @@
+name: Analyze Calculator Mach-O
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - Calculator
+      - .github/workflows/analyze-calculator.yml
+
+jobs:
+  analyze:
+    name: Static reverse analysis
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify target
+        run: |
+          set -euo pipefail
+          test -f Calculator
+          mkdir -p analysis-output
+          file Calculator | tee analysis-output/file.txt
+          shasum -a 256 Calculator | tee analysis-output/sha256.txt
+          ls -lh Calculator | tee analysis-output/ls.txt
+
+      - name: Extract Mach-O and Objective-C metadata
+        run: |
+          set -euo pipefail
+          mkdir -p analysis-output
+
+          # Basic load commands and imported libraries.
+          otool -l Calculator > analysis-output/otool_load_commands.txt || true
+          otool -L Calculator > analysis-output/otool_libraries.txt || true
+          otool -Iv Calculator > analysis-output/otool_indirect_symbols.txt || true
+          nm -m Calculator > analysis-output/nm_macho_symbols.txt 2>&1 || true
+
+          # Objective-C metadata from Apple's otool; useful when custom parsers miss PAC-tagged pointers.
+          otool -ov Calculator > analysis-output/otool_objc_verbose.txt 2>&1 || true
+
+          # Full disassembly can be large, so keep it as an artifact file rather than printing to job logs.
+          otool -tvV Calculator > analysis-output/otool_disassembly.txt 2>&1 || true
+
+      - name: Extract strings and focused evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p analysis-output
+
+          strings -a Calculator > analysis-output/strings_ascii.txt || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          target = Path('Calculator')
+          data = target.read_bytes()
+          out = Path('analysis-output')
+          out.mkdir(exist_ok=True)
+
+          # Extract UTF-16LE strings because many Objective-C/iOS literals appear this way.
+          utf16 = []
+          pattern = re.compile(rb'(?:[\x09\x0a\x0d\x20-\x7e]\x00){4,}')
+          for m in pattern.finditer(data):
+              try:
+                  s = m.group().decode('utf-16le').rstrip('\x00')
+              except UnicodeDecodeError:
+                  continue
+              utf16.append(f'{m.start():#x}\t{s}')
+          (out / 'strings_utf16le.txt').write_text('\n'.join(utf16), encoding='utf-8', errors='replace')
+
+          terms = [
+              'TSHWelcomeViewController', 'LogViewController', 'HUDMainWindow', 'LOGRootWindow',
+              'TSEventFetcher', 'ViewController', 'ToHome:', 'tsh_checkActivationAndEnterHome',
+              'tsh_activationStarted', 'tsh_didEnterHome', 'activation', 'activate', 'verify',
+              '验证', '验证失败', '激活', '激活码', '卡密', '网络请求失败', '不存在',
+              'closePage', 'canCloseLogPanel', 'showLogViewerFromViewController:', 'clearLogsFromViewController:',
+              'hitTest:withEvent:', 'pointInside:withEvent:', 'gestureRecognizer:shouldReceiveTouch:',
+              'touchesBegan:withEvent:', 'touchesEnded:withEvent:', 'isTouchInButtonArea:',
+              'windowLevel', 'setWindowLevel:', 'userInteraction', 'exclusiveTouch', 'delaysTouches',
+              'http://', 'https://', 'URLWithString:', 'requestWithURL:', 'dataTaskWithURL:',
+              'NSMutableURLRequest', 'setHTTPMethod:', 'setValue:forHTTPHeaderField:', 'statusCode',
+              'live_key', 'notification.hud'
+          ]
+
+          ascii_strings = []
+          for m in re.finditer(rb'[\x09\x0a\x0d\x20-\x7e]{4,}', data):
+              s = m.group().decode('latin1', errors='replace')
+              ascii_strings.append((m.start(), s))
+
+          focused = []
+          all_strings = ascii_strings + [
+              (int(line.split('\t', 1)[0], 16), line.split('\t', 1)[1])
+              for line in utf16 if '\t' in line
+          ]
+          for off, s in sorted(all_strings):
+              low = s.lower()
+              if any((term.lower() in low) for term in terms if term.isascii()) or any((term in s) for term in terms if not term.isascii()):
+                  focused.append(f'{off:#x}\t{s}')
+          (out / 'focused_strings.txt').write_text('\n'.join(focused), encoding='utf-8', errors='replace')
+
+          # Context around decisive strings helps correlate nearby selectors/classes/CFStrings.
+          context_lines = []
+          needles = ['LogViewController', 'canCloseLogPanel', 'closePage', 'showLogViewerFromViewController:',
+                     'tsh_checkActivationAndEnterHome', 'ToHome:', '验证失败', '激活码不存在',
+                     '网络请求失败', 'http://', 'https://', 'dataTaskWithURL:', 'setHTTPMethod:']
+          for needle in needles:
+              nb = needle.encode('utf-8')
+              start = 0
+              while True:
+                  pos = data.find(nb, start)
+                  if pos < 0:
+                      break
+                  lo = max(0, pos - 512)
+                  hi = min(len(data), pos + 1024)
+                  chunk = data[lo:hi]
+                  strings = re.findall(rb'[\x09\x0a\x0d\x20-\x7e]{3,}|(?:[\x09\x0a\x0d\x20-\x7e]\x00){3,}', chunk)
+                  context_lines.append(f'==== {needle} at {pos:#x} ====')
+                  for raw in strings[:160]:
+                      try:
+                          if b'\x00' in raw:
+                              text = raw.decode('utf-16le', errors='replace')
+                          else:
+                              text = raw.decode('latin1', errors='replace')
+                      except Exception:
+                          continue
+                      context_lines.append(text)
+                  start = pos + 1
+          (out / 'focused_context.txt').write_text('\n'.join(context_lines), encoding='utf-8', errors='replace')
+          PY
+
+      - name: Parse Objective-C class lists with Python
+        run: |
+          set -euo pipefail
+          mkdir -p analysis-output
+          cat > analysis-output/objc_parse.py <<'PY'
+          from pathlib import Path
+          import struct
+
+          data = Path('Calculator').read_bytes()
+          out = []
+
+          def u32(off): return struct.unpack_from('<I', data, off)[0]
+          def u64(off): return struct.unpack_from('<Q', data, off)[0]
+
+          magic = u32(0)
+          if magic != 0xfeedfacf:
+              raise SystemExit(f'unsupported Mach-O magic: {magic:#x}')
+
+          _, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<IiiIIIII', data, 0)
+          off = 32
+          segments = []
+          sections = {}
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from('<II', data, off)
+              if cmd == 0x19:  # LC_SEGMENT_64
+                  segname = struct.unpack_from('16s', data, off + 8)[0].rstrip(b'\0').decode('utf-8', 'replace')
+                  vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, segflags = struct.unpack_from('<QQQQiiII', data, off + 24)
+                  segments.append((segname, vmaddr, vmsize, fileoff, filesize))
+                  so = off + 72
+                  for _ in range(nsects):
+                      sectname = struct.unpack_from('16s', data, so)[0].rstrip(b'\0').decode('utf-8', 'replace')
+                      sseg = struct.unpack_from('16s', data, so + 16)[0].rstrip(b'\0').decode('utf-8', 'replace')
+                      addr, size, offset, align, reloff, nreloc, sflags, r1, r2, r3 = struct.unpack_from('<QQIIIIIIII', data, so + 32)
+                      sections[(sseg, sectname)] = dict(addr=addr, size=size, offset=offset)
+                      so += 80
+              off += cmdsize
+
+          out.append('Segments:')
+          for seg in segments:
+              out.append(f'  {seg[0]} vm={seg[1]:#x}-{seg[1]+seg[2]:#x} file={seg[3]:#x}+{seg[4]:#x}')
+          out.append('\nObjective-C sections:')
+          for key, val in sorted(sections.items()):
+              if 'objc' in key[1]:
+                  out.append(f'  {key}: addr={val["addr"]:#x} size={val["size"]:#x} off={val["offset"]:#x}')
+
+          def strip_pac(ptr):
+              # arm64e binaries may contain authenticated-looking pointers in static metadata.
+              # Keep the low canonical 64-bit user VA range observed in Mach-O sections.
+              ptr &= 0x0000000fffffffff
+              if ptr < 0x100000000:
+                  ptr += 0x100000000
+              return ptr
+
+          def va_to_off(va):
+              candidates = [va, strip_pac(va), va & ~7, strip_pac(va & ~7)]
+              for cand in candidates:
+                  for name, vmaddr, vmsize, fileoff, filesize in segments:
+                      if vmaddr <= cand < vmaddr + vmsize:
+                          return int(fileoff + (cand - vmaddr))
+              return None
+
+          def read_cstr(va):
+              o = va_to_off(va)
+              if o is None or o >= len(data):
+                  return None
+              e = data.find(b'\0', o, min(len(data), o + 8192))
+              if e < 0:
+                  return None
+              return data[o:e].decode('utf-8', errors='replace')
+
+          def read_method_list(va):
+              o = va_to_off(va)
+              if o is None or o + 8 > len(data):
+                  return []
+              entsize, count = struct.unpack_from('<II', data, o)
+              entsize &= 0x00ffffff
+              if entsize < 24 or count > 1000:
+                  return []
+              rows = []
+              for i in range(count):
+                  eo = o + 8 + i * entsize
+                  if eo + 24 > len(data):
+                      break
+                  name, types, imp = struct.unpack_from('<QQQ', data, eo)
+                  rows.append((read_cstr(name), read_cstr(types), strip_pac(imp)))
+              return rows
+
+          def read_props(va):
+              o = va_to_off(va)
+              if o is None or o + 8 > len(data):
+                  return []
+              entsize, count = struct.unpack_from('<II', data, o)
+              if entsize < 16 or count > 1000:
+                  return []
+              rows = []
+              for i in range(count):
+                  eo = o + 8 + i * entsize
+                  if eo + 16 > len(data):
+                      break
+                  name, attrs = struct.unpack_from('<QQ', data, eo)
+                  rows.append((read_cstr(name), read_cstr(attrs)))
+              return rows
+
+          def read_ivars(va):
+              o = va_to_off(va)
+              if o is None or o + 8 > len(data):
+                  return []
+              entsize, count = struct.unpack_from('<II', data, o)
+              if entsize < 32 or count > 1000:
+                  return []
+              rows = []
+              for i in range(count):
+                  eo = o + 8 + i * entsize
+                  if eo + 32 > len(data):
+                      break
+                  offptr, name, typ, align, size = struct.unpack_from('<QQQII', data, eo)
+                  rows.append((read_cstr(name), read_cstr(typ), size))
+              return rows
+
+          wanted = {
+              'TSHWelcomeViewController', 'LogViewController', 'ViewController', 'HUDMainWindow',
+              'LOGRootWindow', 'HUDDelegate', 'HUDApplication', 'TSEventFetcher', 'TSHAppDelegateNoScene',
+              'DrawRootViewController', 'SettingViewController', 'MenuVC', 'HidVC'
+          }
+
+          clssec = sections.get(('__DATA_CONST', '__objc_classlist'))
+          if clssec:
+              out.append('\nClasses:')
+              start = clssec['offset']
+              count = clssec['size'] // 8
+              for i in range(count):
+                  cls_ptr = u64(start + i * 8)
+                  co = va_to_off(cls_ptr)
+                  if co is None or co + 40 > len(data):
+                      continue
+                  isa, supercls, cache, vtable, data_ptr = struct.unpack_from('<QQQQQ', data, co)
+                  ro = strip_pac(data_ptr) & ~7
+                  roff = va_to_off(ro)
+                  if roff is None or roff + 72 > len(data):
+                      continue
+                  # class_ro_t: flags, instanceStart, instanceSize, reserved, ivarLayout, name, baseMethods, baseProtocols, ivars, weakIvarLayout, baseProperties
+                  flags, inst_start, inst_size, reserved, ivar_layout, name_ptr, methods_ptr, protocols, ivars_ptr, weak, props_ptr = struct.unpack_from('<IIIIQQQQQQQ', data, roff)
+                  cname = read_cstr(name_ptr)
+                  if not cname:
+                      continue
+                  if cname in wanted:
+                      out.append(f'\n@interface {cname}  // class={strip_pac(cls_ptr):#x} super={strip_pac(supercls):#x} ro={ro:#x}')
+                      out.append('  IVARS:')
+                      for name, typ, size in read_ivars(ivars_ptr):
+                          out.append(f'    {name} {typ} size={size}')
+                      out.append('  PROPERTIES:')
+                      for name, attrs in read_props(props_ptr):
+                          out.append(f'    {name} {attrs}')
+                      out.append('  METHODS:')
+                      for name, typ, imp in read_method_list(methods_ptr):
+                          out.append(f'    {imp:#x} {name} {typ}')
+
+          Path('analysis-output/objc_python_parse.txt').write_text('\n'.join(out), encoding='utf-8', errors='replace')
+          PY
+          python3 analysis-output/objc_parse.py
+
+      - name: Build focused reverse report
+        run: |
+          set -euo pipefail
+          mkdir -p analysis-output/focused
+
+          # Slice Objective-C verbose metadata for classes we care about.
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('analysis-output/otool_objc_verbose.txt').read_text(errors='replace')
+          names = ['TSHWelcomeViewController', 'LogViewController', 'ViewController', 'HUDMainWindow', 'LOGRootWindow', 'TSEventFetcher', 'HUDDelegate', 'HUDApplication', 'DrawRootViewController', 'SettingViewController']
+          out = []
+          lines = text.splitlines()
+          for idx, line in enumerate(lines):
+              if any(name in line for name in names):
+                  out.append(f'==== line {idx+1}: {line} ====')
+                  out.extend(lines[max(0, idx-40): min(len(lines), idx+160)])
+          Path('analysis-output/focused/objc_class_slices.txt').write_text('\n'.join(out), encoding='utf-8', errors='replace')
+          PY
+
+          # Focused disassembly slices around interesting selector names if otool includes references nearby.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('analysis-output/otool_disassembly.txt')
+          text = p.read_text(errors='replace') if p.exists() else ''
+          terms = ['tsh_checkActivationAndEnterHome', 'ToHome:', 'LogViewController', 'closePage', 'canCloseLogPanel', 'showLogViewerFromViewController', 'hitTest:withEvent:', 'gestureRecognizer:shouldReceiveTouch:', 'dataTaskWithURL:', 'setHTTPMethod:', 'URLWithString:']
+          lines = text.splitlines()
+          out = []
+          for idx, line in enumerate(lines):
+              if any(term in line for term in terms):
+                  out.append(f'==== disasm line {idx+1}: {line} ====')
+                  out.extend(lines[max(0, idx-80): min(len(lines), idx+180)])
+          Path('analysis-output/focused/disassembly_slices.txt').write_text('\n'.join(out), encoding='utf-8', errors='replace')
+          PY
+
+          {
+            echo '# Calculator analysis index'
+            echo
+            echo 'Key files:'
+            find analysis-output -type f | sort | sed 's#^#- #'
+            echo
+            echo 'Top focused strings:'
+            sed -n '1,260p' analysis-output/focused_strings.txt || true
+            echo
+            echo 'Python ObjC parse:'
+            sed -n '1,260p' analysis-output/objc_python_parse.txt || true
+          } > analysis-output/README_ANALYSIS.md
+
+      - name: Upload analysis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calculator-analysis-output
+          path: analysis-output
+          if-no-files-found: error
