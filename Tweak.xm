@@ -13,6 +13,9 @@ static NSString * const SSHHTargetControllerName = @"TSHWelcomeViewController";
 /// Used only for diagnostics and for dismissing the blocking activation prompt.
 static NSString * const SSHHVerificationTitle = @"验证";
 
+/// Verification-failure alert title observed in runtime logs from TSHWelcomeViewController and LogViewController.
+static NSString * const SSHHVerificationFailureTitle = @"验证失败";
+
 /// Primary file log path under a stable mobile-owned directory that survives jbroot path changes.
 static NSString * const SSHHPrimaryLogPath = @"/var/mobile/SuSu/sshh.log";
 
@@ -92,6 +95,15 @@ static NSString *SSHHDescribeObject(id object) {
 static BOOL SSHHIsTargetWelcomeController(id object) {
     Class targetClass = NSClassFromString(SSHHTargetControllerName);
     return targetClass != Nil && object != nil && [object isKindOfClass:targetClass];
+}
+
+/// Returns YES for the verification alerts proven by runtime logs to block the HUD/log workflow.
+static BOOL SSHHShouldSuppressVerificationAlert(NSString *title, NSString *message, id presenter) {
+    BOOL knownTitle = [title isEqualToString:SSHHVerificationTitle] || [title isEqualToString:SSHHVerificationFailureTitle];
+    BOOL knownFailureText = [message containsString:@"激活码不存在"];
+    BOOL knownPresenter = [presenter isKindOfClass:NSClassFromString(SSHHTargetControllerName)] || [presenter isKindOfClass:NSClassFromString(@"LogViewController")];
+    // Critical logic: keep the suppression narrow to observed activation alerts, not arbitrary app alerts.
+    return knownTitle && (knownFailureText || knownPresenter || [title isEqualToString:SSHHVerificationTitle]);
 }
 
 /// Finds the visible TSHWelcomeViewController by walking the presented/root hierarchy.
@@ -227,6 +239,7 @@ static void SSHHDumpTargetClass(void) {
 static char SSHHHUDButtonKey;
 static char SSHHHUDButtonTargetKey;
 static char SSHHHUDOverlayTargetKey;
+static char SSHHLogCloseButtonKey;
 
 /// Retained top-level window so diagnostic controls stay visible without covering the HUD.
 static UIWindow *SSHHHUDOverlayWindow;
@@ -706,10 +719,12 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
         SSHHLog(@"present controller=%@ presenter=%@", SSHHDescribeObject(viewControllerToPresent), SSHHDescribeObject(self));
     }
 
-    if ([title isEqualToString:SSHHVerificationTitle]) {
-        SSHHLog(@"suppressing verification alert and retrying ToHome:YES");
+    if (SSHHShouldSuppressVerificationAlert(title, message, self)) {
+        SSHHLog(@"suppressing verification alert title=%@ message=%@ presenter=%@", title, message, SSHHDescribeObject(self));
         UIViewController *welcomeController = SSHHFindWelcomeControllerFrom(self) ?: SSHHFindVisibleWelcomeController();
-        SSHHScheduleEnterHome(welcomeController, "presentVerificationAlert");
+        if (welcomeController != nil) {
+            SSHHScheduleEnterHome(welcomeController, "presentVerificationAlert");
+        }
         if (completion != nil) {
             completion();
         }
@@ -727,6 +742,48 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 - (void)viewDidAppear:(BOOL)animated {
     SSHHLog(@"UIAlertController viewDidAppear title=%@ message=%@ self=%@", self.title, self.message, SSHHDescribeObject(self));
     %orig;
+    if (SSHHShouldSuppressVerificationAlert(self.title, self.message, self.presentingViewController)) {
+        SSHHLog(@"dismissing already-presented verification alert title=%@ presenter=%@", self.title, SSHHDescribeObject(self.presentingViewController));
+        // Critical logic: dismiss stale high-level verification alerts that were presented before the hook returned.
+        [self dismissViewControllerAnimated:NO completion:nil];
+    }
+}
+
+%end
+
+%hook LogViewController
+
+/// Force the log panel to report that it is closable so its own close path is enabled.
+- (BOOL)canCloseLogPanel {
+    SSHHLog(@"LogViewController canCloseLogPanel forced YES self=%@", SSHHDescribeObject(self));
+    return YES;
+}
+
+/// Log the original close path; the injected fallback button invokes this selector when available.
+- (void)closePage {
+    SSHHLog(@"LogViewController closePage intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+/// Add a small emergency close button above the log panel in case the original close control is hidden by window level.
+- (void)viewDidAppear:(BOOL)animated {
+    SSHHLog(@"LogViewController viewDidAppear animated=%@ self=%@", animated ? @"YES" : @"NO", SSHHDescribeObject(self));
+    %orig;
+    if (self.view == nil || objc_getAssociatedObject(self, &SSHHLogCloseButtonKey) != nil) {
+        return;
+    }
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.frame = CGRectMake(24.0, 44.0, 120.0, 40.0);
+    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    button.backgroundColor = [UIColor colorWithRed:0.8 green:0.1 blue:0.1 alpha:0.9];
+    button.layer.cornerRadius = 8.0;
+    [button setTitle:@"关闭日志" forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    // Critical logic: call the app's recovered closePage action directly; no private state is modified here.
+    [button addTarget:self action:@selector(closePage) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:button];
+    objc_setAssociatedObject(self, &SSHHLogCloseButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    SSHHLog(@"LogViewController emergency close button installed button=%@", SSHHDescribeObject(button));
 }
 
 %end
