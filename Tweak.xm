@@ -3,6 +3,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <notify.h>
 
 /// Target controller identified from the Calculator binary.
 /// Keeping this as a single constant makes all runtime checks narrow and auditable.
@@ -237,6 +238,7 @@ static UIWindow *SSHHHUDOverlayWindow;
 /// Forward declarations used by the overlay button target implementation.
 static void SSHHTryLaunchHUDFromController(UIViewController *controller);
 static void SSHHTryCloseDrawingFromController(UIViewController *controller);
+static void SSHHTryToggleLiveModeFromController(UIViewController *controller);
 static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 
 /// Small Objective-C target object retained by the welcome controller.
@@ -255,10 +257,16 @@ static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
     SSHHSetOverlayStartButtonHidden(YES);
 }
 
-/// Button action: trigger the app's own close-drawing button when it exists in the live view tree.
+/// Button action: trigger the app's own close-drawing handler when it exists in the live view tree.
 - (void)sshh_closeDrawingButtonTapped:(UIButton *)sender {
     SSHHLog(@"close drawing button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
     SSHHTryCloseDrawingFromController(self.controller ?: SSHHFindVisibleWelcomeController());
+}
+
+/// Button action: toggle the HUD live-mode state and notify the HUD runtime.
+- (void)sshh_toggleLiveModeButtonTapped:(UIButton *)sender {
+    SSHHLog(@"live mode button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
+    SSHHTryToggleLiveModeFromController(self.controller ?: SSHHFindVisibleWelcomeController());
 }
 
 @end
@@ -412,6 +420,71 @@ static void SSHHCollectButtonsMatchingTitle(UIView *view, NSString *needle, NSMu
     }
 }
 
+/// Collects live controller objects from all active windows for direct HUD selector invocation.
+static NSArray *SSHHCollectRuntimeCandidates(UIViewController *controller) {
+    NSMutableArray *candidates = [NSMutableArray array];
+    if (controller != nil) {
+        [candidates addObject:controller];
+    }
+    id appDelegate = UIApplication.sharedApplication.delegate;
+    if (appDelegate != nil) {
+        [candidates addObject:appDelegate];
+    }
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window == SSHHHUDOverlayWindow) {
+                continue;
+            }
+            SSHHLog(@"runtime candidate window %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
+            SSHHCollectControllers(window.rootViewController, candidates);
+        }
+    }
+    return candidates;
+}
+
+/// Invokes a known no-argument action selector on existing runtime objects only.
+static NSUInteger SSHHInvokeKnownNoArgAction(NSArray *candidates, NSString *selectorName, NSString *source) {
+    SEL selector = NSSelectorFromString(selectorName);
+    NSUInteger invoked = 0;
+    for (id candidate in candidates) {
+        if (![candidate respondsToSelector:selector]) {
+            continue;
+        }
+        SSHHLog(@"%@ invoke selector=%@ object=%@", source, selectorName, SSHHDescribeObject(candidate));
+        @try {
+            // Critical logic: only call vetted HUD control selectors recovered from Calculator metadata.
+            ((void (*)(id, SEL))objc_msgSend)(candidate, selector);
+            invoked++;
+        } @catch (NSException *exception) {
+            SSHHLog(@"%@ exception selector=%@ object=%@ name=%@ reason=%@", source, selectorName, SSHHDescribeObject(candidate), exception.name, exception.reason);
+        }
+    }
+    return invoked;
+}
+
+/// Invokes a known one-object action selector on existing runtime objects only.
+static NSUInteger SSHHInvokeKnownObjectAction(NSArray *candidates, NSString *selectorName, id argument, NSString *source) {
+    SEL selector = NSSelectorFromString(selectorName);
+    NSUInteger invoked = 0;
+    for (id candidate in candidates) {
+        if (![candidate respondsToSelector:selector]) {
+            continue;
+        }
+        SSHHLog(@"%@ invoke selector=%@ object=%@ argument=%@", source, selectorName, SSHHDescribeObject(candidate), SSHHDescribeObject(argument));
+        @try {
+            // Critical logic: match UIKit action signature such as liveSwitchChanged: without guessing extra args.
+            ((void (*)(id, SEL, id))objc_msgSend)(candidate, selector, argument);
+            invoked++;
+        } @catch (NSException *exception) {
+            SSHHLog(@"%@ exception selector=%@ object=%@ name=%@ reason=%@", source, selectorName, SSHHDescribeObject(candidate), exception.name, exception.reason);
+        }
+    }
+    return invoked;
+}
+
 /// Hides or shows the overlay start button by title, leaving the close-drawing button available.
 static void SSHHSetOverlayStartButtonHidden(BOOL hidden) {
     if (SSHHHUDOverlayWindow == nil) {
@@ -425,9 +498,16 @@ static void SSHHSetOverlayStartButtonHidden(BOOL hidden) {
     }
 }
 
-/// Tries to close drawing through the app's own visible button rather than guessing private state.
+/// Tries to close drawing through the recovered closeTapped selector, then falls back to visible buttons.
 static void SSHHTryCloseDrawingFromController(UIViewController *controller) {
     SSHHLog(@"close drawing discovery start controller=%@", SSHHDescribeObject(controller));
+
+    NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
+    NSUInteger invoked = SSHHInvokeKnownNoArgAction(candidates, @"closeTapped", @"close drawing");
+    if (invoked > 0) {
+        SSHHLog(@"close drawing finished via closeTapped invoked=%lu", (unsigned long)invoked);
+        return;
+    }
 
     NSMutableArray<UIButton *> *matches = [NSMutableArray array];
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -435,8 +515,6 @@ static void SSHHTryCloseDrawingFromController(UIViewController *controller) {
             continue;
         }
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            SSHHLog(@"close drawing window candidate %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
-            // Critical logic: skip our diagnostic overlay so we do not recursively tap our own close button.
             if (window == SSHHHUDOverlayWindow) {
                 continue;
             }
@@ -445,7 +523,7 @@ static void SSHHTryCloseDrawingFromController(UIViewController *controller) {
     }
 
     if (matches.count == 0) {
-        SSHHLog(@"close drawing failed: no visible button titled 关闭绘制 was found");
+        SSHHLog(@"close drawing failed: no closeTapped responder and no visible button titled 关闭绘制");
         return;
     }
 
@@ -453,6 +531,28 @@ static void SSHHTryCloseDrawingFromController(UIViewController *controller) {
         SSHHLog(@"close drawing invoking original button=%@ title=%@", SSHHDescribeObject(button), button.currentTitle ?: [button titleForState:UIControlStateNormal]);
         [button sendActionsForControlEvents:UIControlEventTouchUpInside];
     }
+}
+
+/// Toggles live mode using recovered live_key, liveSwitchChanged:, refreshLiveMode, and Darwin notification strings.
+static void SSHHTryToggleLiveModeFromController(UIViewController *controller) {
+    SSHHLog(@"live mode discovery start controller=%@", SSHHDescribeObject(controller));
+
+    BOOL nextEnabled = ![NSUserDefaults.standardUserDefaults boolForKey:@"live_key"];
+    [NSUserDefaults.standardUserDefaults setBool:nextEnabled forKey:@"live_key"];
+    [NSUserDefaults.standardUserDefaults synchronize];
+    SSHHLog(@"live mode defaults live_key=%@", nextEnabled ? @"YES" : @"NO");
+
+    UISwitch *senderSwitch = [UISwitch new];
+    senderSwitch.on = nextEnabled;
+    NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
+    NSUInteger switchInvoked = SSHHInvokeKnownObjectAction(candidates, @"liveSwitchChanged:", senderSwitch, @"live mode");
+    NSUInteger refreshInvoked = SSHHInvokeKnownNoArgAction(candidates, @"refreshLiveMode", @"live mode");
+
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    NSString *notificationName = [NSString stringWithFormat:@"%@.notification.hud.live-mode-changed", bundleID];
+    // Critical logic: notify the HUD process path recovered from Calculator strings without relying on UI reachability.
+    notify_post(notificationName.UTF8String);
+    SSHHLog(@"live mode notified name=%@ switchInvoked=%lu refreshInvoked=%lu", notificationName, (unsigned long)switchInvoked, (unsigned long)refreshInvoked);
 }
 
 /// Adds a visible diagnostic button to the activation screen.
@@ -501,7 +601,7 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
         }
     }
 
-    CGRect overlayFrame = CGRectMake(24.0, 80.0, 160.0, 96.0);
+    CGRect overlayFrame = CGRectMake(24.0, 80.0, 160.0, 148.0);
     UIWindow *overlayWindow = nil;
     if (activeWindowScene != nil) {
         overlayWindow = [[SSHHPassthroughWindow alloc] initWithWindowScene:activeWindowScene];
@@ -535,16 +635,26 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     [closeButton setTitle:@"关闭绘制" forState:UIControlStateNormal];
     [closeButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
 
+    UIButton *liveButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    liveButton.frame = CGRectMake(0.0, 104.0, overlayFrame.size.width, 44.0);
+    liveButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    liveButton.backgroundColor = [UIColor colorWithRed:0.15 green:0.6 blue:0.25 alpha:0.85];
+    liveButton.layer.cornerRadius = 10.0;
+    [liveButton setTitle:@"直播模式" forState:UIControlStateNormal];
+    [liveButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
     SSHHHUDButtonTarget *overlayTarget = [SSHHHUDButtonTarget new];
     overlayTarget.controller = controller;
     [overlayButton addTarget:overlayTarget action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [closeButton addTarget:overlayTarget action:@selector(sshh_closeDrawingButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [liveButton addTarget:overlayTarget action:@selector(sshh_toggleLiveModeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [rootController.view addSubview:overlayButton];
     [rootController.view addSubview:closeButton];
+    [rootController.view addSubview:liveButton];
     objc_setAssociatedObject(rootController, &SSHHHUDOverlayTargetKey, overlayTarget, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     SSHHHUDOverlayWindow = overlayWindow;
-    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ closeButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(activeWindowScene));
+    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ closeButton=%@ liveButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(liveButton), SSHHDescribeObject(activeWindowScene));
 }
 
 %hook TSHWelcomeViewController
@@ -645,6 +755,32 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 /// Log floating-ball display to determine whether manual invocation reaches visible UI.
 - (void)showFloatingBall {
     SSHHLog(@"ViewController showFloatingBall intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+%end
+
+%hook DrawRootViewController
+
+/// Log the recovered drawing close handler so button behavior can be verified at runtime.
+- (void)closeTapped {
+    SSHHLog(@"DrawRootViewController closeTapped intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+%end
+
+%hook SettingViewController
+
+/// Log the recovered live-mode switch action and the UISwitch state passed by our helper or the original UI.
+- (void)liveSwitchChanged:(UISwitch *)sender {
+    SSHHLog(@"SettingViewController liveSwitchChanged: intercepted self=%@ sender=%@ on=%@", SSHHDescribeObject(self), SSHHDescribeObject(sender), sender.on ? @"YES" : @"NO");
+    %orig;
+}
+
+/// Log live-mode refreshes to confirm the defaults/notification path is being consumed.
+- (void)refreshLiveMode {
+    SSHHLog(@"SettingViewController refreshLiveMode intercepted self=%@", SSHHDescribeObject(self));
     %orig;
 }
 
