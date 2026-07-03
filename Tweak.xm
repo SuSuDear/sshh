@@ -252,6 +252,7 @@ static UIWindow *SSHHHUDOverlayWindow;
 static void SSHHTryLaunchHUDFromController(UIViewController *controller);
 static void SSHHTryCloseDrawingFromController(UIViewController *controller);
 static void SSHHTryToggleLiveModeFromController(UIViewController *controller);
+static void SSHHTryCloseLogFromRuntime(UIViewController *controller);
 static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 
 /// Small Objective-C target object retained by the welcome controller.
@@ -280,6 +281,12 @@ static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 - (void)sshh_toggleLiveModeButtonTapped:(UIButton *)sender {
     SSHHLog(@"live mode button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
     SSHHTryToggleLiveModeFromController(self.controller ?: SSHHFindVisibleWelcomeController());
+}
+
+/// Button action: close the high-level log panel from our app-level overlay.
+- (void)sshh_closeLogButtonTapped:(UIButton *)sender {
+    SSHHLog(@"close log button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
+    SSHHTryCloseLogFromRuntime(self.controller ?: SSHHFindVisibleWelcomeController());
 }
 
 @end
@@ -451,9 +458,17 @@ static NSArray *SSHHCollectRuntimeCandidates(UIViewController *controller) {
             if (window == SSHHHUDOverlayWindow) {
                 continue;
             }
-            SSHHLog(@"runtime candidate window %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
+            SSHHLog(@"runtime candidate scene-window %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
             SSHHCollectControllers(window.rootViewController, candidates);
         }
+    }
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window == SSHHHUDOverlayWindow) {
+            continue;
+        }
+        SSHHLog(@"runtime candidate app-window %@ root=%@", SSHHDescribeObject(window), SSHHDescribeObject(window.rootViewController));
+        // Critical logic: include legacy/high-level HUD windows, because LogViewController may not be in scene.windows.
+        SSHHCollectControllers(window.rootViewController, candidates);
     }
     return candidates;
 }
@@ -568,6 +583,19 @@ static void SSHHTryToggleLiveModeFromController(UIViewController *controller) {
     SSHHLog(@"live mode notified name=%@ switchInvoked=%lu refreshInvoked=%lu", notificationName, (unsigned long)switchInvoked, (unsigned long)refreshInvoked);
 }
 
+
+/// Closes the log floating panel from our app-level controls by invoking the recovered closePage action.
+static void SSHHTryCloseLogFromRuntime(UIViewController *controller) {
+    SSHHLog(@"close log discovery start controller=%@", SSHHDescribeObject(controller));
+    NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
+    NSUInteger invoked = SSHHInvokeKnownNoArgAction(candidates, @"closePage", @"close log");
+    if (invoked > 0) {
+        SSHHLog(@"close log finished via closePage invoked=%lu", (unsigned long)invoked);
+        return;
+    }
+    SSHHLog(@"close log failed: no closePage responder was found");
+}
+
 /// Adds a visible diagnostic button to the activation screen.
 /// The button does not hide alerts; it only exposes and logs the existing HUD launch path.
 static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
@@ -581,7 +609,7 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 
     if (objc_getAssociatedObject(controller, &SSHHHUDButtonKey) == nil) {
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.frame = CGRectMake(24.0, 120.0, 160.0, 44.0);
+        button.frame = CGRectMake(24.0, 260.0, 160.0, 44.0);
         button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
         button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
         button.layer.cornerRadius = 10.0;
@@ -614,7 +642,7 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
         }
     }
 
-    CGRect overlayFrame = CGRectMake(24.0, 80.0, 160.0, 148.0);
+    CGRect overlayFrame = CGRectMake(24.0, 64.0, 170.0, 256.0);
     UIWindow *overlayWindow = nil;
     if (activeWindowScene != nil) {
         overlayWindow = [[SSHHPassthroughWindow alloc] initWithWindowScene:activeWindowScene];
@@ -633,7 +661,7 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     overlayWindow.hidden = NO;
 
     UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    overlayButton.frame = CGRectMake(0.0, 0.0, overlayFrame.size.width, 44.0);
+    overlayButton.frame = CGRectMake(0.0, 0.0, overlayFrame.size.width, 48.0);
     overlayButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
     overlayButton.backgroundColor = [UIColor colorWithRed:0.15 green:0.35 blue:1.0 alpha:0.85];
     overlayButton.layer.cornerRadius = 10.0;
@@ -641,7 +669,7 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     [overlayButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
 
     UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeButton.frame = CGRectMake(0.0, 52.0, overlayFrame.size.width, 44.0);
+    closeButton.frame = CGRectMake(0.0, 68.0, overlayFrame.size.width, 48.0);
     closeButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
     closeButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.15 blue:0.15 alpha:0.85];
     closeButton.layer.cornerRadius = 10.0;
@@ -649,25 +677,35 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     [closeButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
 
     UIButton *liveButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    liveButton.frame = CGRectMake(0.0, 104.0, overlayFrame.size.width, 44.0);
+    liveButton.frame = CGRectMake(0.0, 136.0, overlayFrame.size.width, 48.0);
     liveButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
     liveButton.backgroundColor = [UIColor colorWithRed:0.15 green:0.6 blue:0.25 alpha:0.85];
     liveButton.layer.cornerRadius = 10.0;
     [liveButton setTitle:@"直播模式" forState:UIControlStateNormal];
     [liveButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
 
+    UIButton *logButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    logButton.frame = CGRectMake(0.0, 204.0, overlayFrame.size.width, 48.0);
+    logButton.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    logButton.backgroundColor = [UIColor colorWithRed:0.55 green:0.2 blue:0.8 alpha:0.85];
+    logButton.layer.cornerRadius = 10.0;
+    [logButton setTitle:@"关闭日志浮窗" forState:UIControlStateNormal];
+    [logButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
     SSHHHUDButtonTarget *overlayTarget = [SSHHHUDButtonTarget new];
     overlayTarget.controller = controller;
     [overlayButton addTarget:overlayTarget action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [closeButton addTarget:overlayTarget action:@selector(sshh_closeDrawingButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [liveButton addTarget:overlayTarget action:@selector(sshh_toggleLiveModeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [logButton addTarget:overlayTarget action:@selector(sshh_closeLogButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [rootController.view addSubview:overlayButton];
     [rootController.view addSubview:closeButton];
     [rootController.view addSubview:liveButton];
+    [rootController.view addSubview:logButton];
     objc_setAssociatedObject(rootController, &SSHHHUDOverlayTargetKey, overlayTarget, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     SSHHHUDOverlayWindow = overlayWindow;
-    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ closeButton=%@ liveButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(liveButton), SSHHDescribeObject(activeWindowScene));
+    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ closeButton=%@ liveButton=%@ logButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(liveButton), SSHHDescribeObject(logButton), SSHHDescribeObject(activeWindowScene));
 }
 
 %hook TSHWelcomeViewController
