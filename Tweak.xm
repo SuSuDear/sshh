@@ -22,6 +22,9 @@ static NSString * const SSHHPrimaryLogPath = @"/var/mobile/SuSu/sshh.log";
 /// Fallback path used if the sandbox cannot write to the workspace path.
 static NSString * const SSHHFallbackLogPath = @"/tmp/sshh.log";
 
+/// Darwin notification used to close the high-level log window from any injected runtime that owns it.
+static NSString * const SSHHCloseLogNotificationName = @"com.susu.sshh.close-log-window";
+
 /// Serial queue used to avoid interleaved writes from UIKit callbacks.
 static dispatch_queue_t SSHHLogQueue(void) {
     static dispatch_queue_t queue;
@@ -254,6 +257,8 @@ static void SSHHTryLaunchHUDFromController(UIViewController *controller);
 static void SSHHTryCloseDrawingFromController(UIViewController *controller);
 static void SSHHTryToggleLiveModeFromController(UIViewController *controller);
 static void SSHHTryCloseLogFromRuntime(UIViewController *controller);
+static NSArray<UIWindow *> *SSHHLegacyApplicationWindows(void);
+static NSUInteger SSHHHideLogWindowsFromRuntime(const char *reason);
 static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 
 /// Small Objective-C target object retained by the welcome controller.
@@ -287,6 +292,8 @@ static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
 /// Button action: close the high-level log panel from our app-level overlay.
 - (void)sshh_closeLogButtonTapped:(UIButton *)sender {
     SSHHLog(@"close log button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
+    /// Critical logic: notify every injected runtime first because the log panel is a high-level floating window, not an app child view.
+    notify_post(SSHHCloseLogNotificationName.UTF8String);
     SSHHTryCloseLogFromRuntime(self.controller ?: SSHHFindVisibleWelcomeController());
 }
 
@@ -463,13 +470,7 @@ static NSArray *SSHHCollectRuntimeCandidates(UIViewController *controller) {
             SSHHCollectControllers(window.rootViewController, candidates);
         }
     }
-    SEL appWindowsSelector = NSSelectorFromString(@"windows");
-    NSArray<UIWindow *> *legacyWindows = nil;
-    if ([UIApplication.sharedApplication respondsToSelector:appWindowsSelector]) {
-        /// Critical logic: call deprecated UIApplication.windows through objc_msgSend to keep legacy/high-level HUD windows reachable without tripping SDK -Werror.
-        legacyWindows = ((NSArray<UIWindow *> *(*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, appWindowsSelector);
-    }
-    for (UIWindow *window in legacyWindows) {
+    for (UIWindow *window in SSHHLegacyApplicationWindows()) {
         if (window == SSHHHUDOverlayWindow) {
             continue;
         }
@@ -602,6 +603,119 @@ static NSString *SSHHBodyPreview(NSData *data) {
     return text ?: @"";
 }
 
+
+/// Reads an Objective-C object ivar only when the runtime class really declares it.
+/// Critical logic: this avoids relying on normal window hierarchy when HUDDelegate owns a private _logwindow.
+static id SSHHObjectIvarIfPresent(id object, const char *ivarName) {
+    if (object == nil || ivarName == NULL) {
+        return nil;
+    }
+    Ivar ivar = class_getInstanceVariable([object class], ivarName);
+    if (ivar == NULL) {
+        return nil;
+    }
+    return object_getIvar(object, ivar);
+}
+
+/// Returns the deprecated UIApplication.windows list through objc_msgSend so high-level legacy HUD windows are still visible to us.
+static NSArray<UIWindow *> *SSHHLegacyApplicationWindows(void) {
+    SEL appWindowsSelector = NSSelectorFromString(@"windows");
+    if (![UIApplication.sharedApplication respondsToSelector:appWindowsSelector]) {
+        return @[];
+    }
+    /// Critical logic: keep legacy/high-level windows reachable without compiling against the deprecated property directly.
+    NSArray<UIWindow *> *windows = ((NSArray<UIWindow *> *(*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, appWindowsSelector);
+    return [windows isKindOfClass:[NSArray class]] ? windows : @[];
+}
+
+/// Collects scene and legacy windows in the current runtime.
+static NSArray<UIWindow *> *SSHHAllRuntimeWindows(void) {
+    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
+        }
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window != nil && ![windows containsObject:window]) {
+                [windows addObject:window];
+            }
+        }
+    }
+    for (UIWindow *window in SSHHLegacyApplicationWindows()) {
+        if (window != nil && ![windows containsObject:window]) {
+            [windows addObject:window];
+        }
+    }
+    return windows;
+}
+
+/// Returns YES for the known high-level log window that displays status text such as 加载成功 / 现在可关闭日志.
+static BOOL SSHHIsLogWindowCandidate(UIWindow *window) {
+    if (window == nil || window == SSHHHUDOverlayWindow) {
+        return NO;
+    }
+    NSString *windowClass = NSStringFromClass([window class]);
+    NSString *rootClass = NSStringFromClass([window.rootViewController class]);
+    NSString *description = window.description ?: @"";
+    Class logControllerClass = NSClassFromString(@"LogViewController");
+    BOOL hasLogRoot = logControllerClass != Nil && [window.rootViewController isKindOfClass:logControllerClass];
+    BOOL namedLogWindow = [windowClass containsString:@"LOGRootWindow"] || [windowClass containsString:@"LogWindow"] || [description containsString:@"LOGRootWindow"];
+    BOOL namedLogRoot = [rootClass containsString:@"LogViewController"];
+    /// Critical logic: require either the recovered LogViewController root or the recovered LOGRootWindow class name.
+    return hasLogRoot || namedLogWindow || namedLogRoot;
+}
+
+/// Hides one log window without destroying it, so the operation is reversible by the target if it recreates/shows it later.
+static BOOL SSHHHideLogWindow(UIWindow *window, NSString *source) {
+    if (!SSHHIsLogWindowCandidate(window)) {
+        return NO;
+    }
+    SSHHLog(@"hide log window source=%@ window=%@ class=%@ root=%@ level=%.1f hidden=%@ alpha=%.2f", source, SSHHDescribeObject(window), NSStringFromClass([window class]), SSHHDescribeObject(window.rootViewController), window.windowLevel, window.hidden ? @"YES" : @"NO", window.alpha);
+    /// Critical logic: disable visibility and interaction at the UIWindow level because the panel floats above normal app views.
+    window.userInteractionEnabled = NO;
+    window.alpha = 0.0;
+    window.hidden = YES;
+    window.rootViewController.view.hidden = YES;
+    return YES;
+}
+
+/// Directly closes the high-level log panel by hiding HUDDelegate.logwindow/_logwindow and any LOGRootWindow candidates.
+static NSUInteger SSHHHideLogWindowsFromRuntime(const char *reason) {
+    NSString *source = [NSString stringWithFormat:@"%s", reason ?: "unknown"];
+    NSUInteger hiddenCount = 0;
+    id appDelegate = UIApplication.sharedApplication.delegate;
+
+    SEL logWindowSelector = NSSelectorFromString(@"logwindow");
+    if (appDelegate != nil && [appDelegate respondsToSelector:logWindowSelector]) {
+        UIWindow *logWindow = ((UIWindow *(*)(id, SEL))objc_msgSend)(appDelegate, logWindowSelector);
+        if (SSHHHideLogWindow(logWindow, [source stringByAppendingString:@":delegate.logwindow"])) {
+            hiddenCount++;
+        }
+    }
+
+    UIWindow *ivarLogWindow = SSHHObjectIvarIfPresent(appDelegate, "_logwindow");
+    if (SSHHHideLogWindow(ivarLogWindow, [source stringByAppendingString:@":delegate._logwindow"])) {
+        hiddenCount++;
+    }
+
+    id logController = SSHHFindLogControllerFromRuntime(nil);
+    if ([logController isKindOfClass:[UIViewController class]]) {
+        UIWindow *controllerWindow = ((UIViewController *)logController).view.window;
+        if (SSHHHideLogWindow(controllerWindow, [source stringByAppendingString:@":logVC.view.window"])) {
+            hiddenCount++;
+        }
+    }
+
+    for (UIWindow *window in SSHHAllRuntimeWindows()) {
+        if (SSHHHideLogWindow(window, [source stringByAppendingString:@":window-scan"])) {
+            hiddenCount++;
+        }
+    }
+
+    SSHHLog(@"hide log windows finished reason=%@ hiddenCount=%lu", source, (unsigned long)hiddenCount);
+    return hiddenCount;
+}
+
 /// Hides or shows the overlay start button by title, leaving the close-drawing button available.
 static void SSHHSetOverlayStartButtonHidden(BOOL hidden) {
     if (SSHHHUDOverlayWindow == nil) {
@@ -677,15 +791,14 @@ static void SSHHTryToggleLiveModeFromController(UIViewController *controller) {
 static void SSHHTryCloseLogFromRuntime(UIViewController *controller) {
     SSHHLog(@"close log discovery start controller=%@", SSHHDescribeObject(controller));
 
+    NSUInteger hiddenBefore = SSHHHideLogWindowsFromRuntime("buttonBeforeClosePage");
     id logController = SSHHFindLogControllerFromRuntime(controller);
     if (logController != nil && [logController respondsToSelector:@selector(closePage)]) {
         SSHHConfigureLogPanelForTouch(logController, "appOverlayClose");
         SSHHLog(@"close log invoking delegate/runtime logController.closePage object=%@", SSHHDescribeObject(logController));
         @try {
-            /// Critical logic: prefer HUDDelegate.logVC.closePage because the log window is not always reachable from scene.windows.
+            /// Critical logic: still call the app's original close path, but do not trust it as the only close mechanism.
             ((void (*)(id, SEL))objc_msgSend)(logController, @selector(closePage));
-            SSHHLog(@"close log finished via direct logController.closePage");
-            return;
         } @catch (NSException *exception) {
             SSHHLog(@"close log direct closePage exception object=%@ name=%@ reason=%@", SSHHDescribeObject(logController), exception.name, exception.reason);
         }
@@ -693,11 +806,8 @@ static void SSHHTryCloseLogFromRuntime(UIViewController *controller) {
 
     NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
     NSUInteger invoked = SSHHInvokeKnownNoArgAction(candidates, @"closePage", @"close log");
-    if (invoked > 0) {
-        SSHHLog(@"close log finished via closePage invoked=%lu", (unsigned long)invoked);
-        return;
-    }
-    SSHHLog(@"close log failed: no closePage responder was found");
+    NSUInteger hiddenAfter = SSHHHideLogWindowsFromRuntime("buttonAfterClosePage");
+    SSHHLog(@"close log finished hiddenBefore=%lu closePageInvoked=%lu hiddenAfter=%lu", (unsigned long)hiddenBefore, (unsigned long)invoked, (unsigned long)hiddenAfter);
 }
 
 /// Adds a visible diagnostic button to the activation screen.
@@ -1094,5 +1204,10 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 %ctor {
     NSBundle *mainBundle = NSBundle.mainBundle;
     SSHHLog(@"Loaded bundleID=%@ executable=%@ process=%@", mainBundle.bundleIdentifier, mainBundle.executablePath.lastPathComponent, NSProcessInfo.processInfo.processName);
+    int closeLogToken = 0;
+    notify_register_dispatch(SSHHCloseLogNotificationName.UTF8String, &closeLogToken, dispatch_get_main_queue(), ^(int token) {
+        /// Critical logic: close the floating log window in whichever injected runtime owns that high-level UIWindow.
+        SSHHHideLogWindowsFromRuntime("darwinNotification");
+    });
     SSHHDumpTargetClass();
 }
