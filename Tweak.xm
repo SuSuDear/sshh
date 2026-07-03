@@ -25,6 +25,9 @@ static NSString * const SSHHFallbackLogPath = @"/tmp/sshh.log";
 /// Darwin notification used to close the high-level log window from any injected runtime that owns it.
 static NSString * const SSHHCloseLogNotificationName = @"com.susu.sshh.close-log-window";
 
+/// Preference suite recovered from the binary for HUD and live-mode switches.
+static NSString * const SSHHRecoveredPreferenceSuite = @"com.apple.wuxinglan";
+
 /// Serial queue used to avoid interleaved writes from UIKit callbacks.
 static dispatch_queue_t SSHHLogQueue(void) {
     static dispatch_queue_t queue;
@@ -244,6 +247,7 @@ static char SSHHHUDButtonTargetKey;
 static char SSHHHUDOverlayTargetKey;
 static char SSHHLogCloseButtonKey;
 static char SSHHLoggedCompletionKey;
+static char SSHHFloatingProxyButtonKey;
 
 /// Retained top-level window so diagnostic controls stay visible without covering the HUD.
 static UIWindow *SSHHHUDOverlayWindow;
@@ -257,6 +261,7 @@ static void SSHHTryLaunchHUDFromController(UIViewController *controller);
 static id SSHHObjectIvarIfPresent(id object, const char *ivarName);
 static NSArray<UIWindow *> *SSHHAllRuntimeWindows(void);
 static NSUInteger SSHHRestoreFloatingBallFromRuntime(UIViewController *controller, const char *reason);
+static NSUInteger SSHHOpenMenuFromFloatingProxy(UIViewController *controller, id sender, const char *reason);
 static void SSHHTryCloseDrawingFromController(UIViewController *controller);
 static void SSHHTryToggleLiveModeFromController(UIViewController *controller);
 static void SSHHTryCloseLogFromRuntime(UIViewController *controller);
@@ -280,6 +285,15 @@ static void SSHHSetOverlayStartButtonHidden(BOOL hidden);
     NSUInteger restored = SSHHRestoreFloatingBallFromRuntime(controller, "launchButtonTapped");
     // Critical logic: hide our start button only when the original floating ball/window was actually restored.
     SSHHSetOverlayStartButtonHidden(restored > 0);
+}
+
+/// Button action: open the original floating-ball menu through a proxy control that we know receives UIKit touches.
+- (void)sshh_floatingBallButtonTapped:(UIButton *)sender {
+    SSHHLog(@"floating proxy button tapped sender=%@ controller=%@", SSHHDescribeObject(sender), SSHHDescribeObject(self.controller));
+    UIViewController *controller = self.controller ?: SSHHFindVisibleWelcomeController();
+    SSHHTryLaunchHUDFromController(controller);
+    SSHHRestoreFloatingBallFromRuntime(controller, "floatingProxyTapped");
+    SSHHOpenMenuFromFloatingProxy(controller, sender, "floatingProxyTapped");
 }
 
 /// Button action: trigger the app's own close-drawing handler when it exists in the live view tree.
@@ -527,6 +541,67 @@ static NSUInteger SSHHInvokeKnownObjectAction(NSArray *candidates, NSString *sel
 }
 
 
+/// Returns both standard defaults and the recovered suite used by the original HUD code.
+static NSArray<NSUserDefaults *> *SSHHRecoveredDefaultsStores(void) {
+    NSMutableArray<NSUserDefaults *> *stores = [NSMutableArray arrayWithObject:NSUserDefaults.standardUserDefaults];
+    NSUserDefaults *suiteDefaults = [[NSUserDefaults alloc] initWithSuiteName:SSHHRecoveredPreferenceSuite];
+    if (suiteDefaults != nil) {
+        [stores addObject:suiteDefaults];
+    }
+    return stores;
+}
+
+/// Writes a BOOL to every recovered defaults store so app code using either accessor observes the same state.
+static void SSHHSetRecoveredBool(BOOL value, NSString *key) {
+    for (NSUserDefaults *defaults in SSHHRecoveredDefaultsStores()) {
+        [defaults setBool:value forKey:key];
+        [defaults synchronize];
+        SSHHLog(@"defaults set key=%@ value=%@ store=%@", key, value ? @"YES" : @"NO", SSHHDescribeObject(defaults));
+    }
+}
+
+/// Reads a BOOL from the recovered suite first, then standard defaults.
+static BOOL SSHHRecoveredBoolForKey(NSString *key) {
+    NSArray<NSUserDefaults *> *stores = SSHHRecoveredDefaultsStores();
+    for (NSUserDefaults *defaults in [stores reverseObjectEnumerator]) {
+        id value = [defaults objectForKey:key];
+        if (value != nil) {
+            BOOL result = [defaults boolForKey:key];
+            SSHHLog(@"defaults read key=%@ value=%@ store=%@", key, result ? @"YES" : @"NO", SSHHDescribeObject(defaults));
+            return result;
+        }
+    }
+    return NO;
+}
+
+/// Opens the original menu path from our proxy round button instead of trusting the original floating ball touch chain.
+static NSUInteger SSHHOpenMenuFromFloatingProxy(UIViewController *controller, id sender, const char *reason) {
+    NSString *source = [NSString stringWithFormat:@"%s", reason ?: "unknown"];
+    NSArray *candidates = SSHHCollectRuntimeCandidates(controller);
+    NSUInteger invoked = 0;
+
+    /// Critical logic: floatingBallClicked: is the recovered original tap handler; pass our known-clickable proxy button as sender.
+    invoked += SSHHInvokeKnownObjectAction(candidates, @"floatingBallClicked:", sender, [source stringByAppendingString:@":floatingBallClicked"]);
+    invoked += SSHHInvokeKnownNoArgAction(candidates, @"setupMenu", [source stringByAppendingString:@":setupMenu"]);
+    invoked += SSHHInvokeKnownNoArgAction(candidates, @"showFloatingBall", [source stringByAppendingString:@":showFloatingBall"]);
+
+    Class viewControllerClass = NSClassFromString(@"ViewController");
+    if (invoked == 0 && viewControllerClass != Nil) {
+        id viewController = [[viewControllerClass alloc] init];
+        SSHHLog(@"floating proxy instantiated ViewController=%@", SSHHDescribeObject(viewController));
+        invoked += SSHHInvokeNoArgIfPossible(viewController, NSSelectorFromString(@"setupFloatingBall"), [source stringByAppendingString:@":newVC.setupFloatingBall"]);
+        invoked += SSHHInvokeNoArgIfPossible(viewController, NSSelectorFromString(@"setupMenu"), [source stringByAppendingString:@":newVC.setupMenu"]);
+        if ([viewController respondsToSelector:NSSelectorFromString(@"floatingBallClicked:")]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(viewController, NSSelectorFromString(@"floatingBallClicked:"), sender);
+            invoked++;
+        }
+    }
+
+    SSHHLog(@"floating proxy open finished reason=%@ invoked=%lu sender=%@", source, (unsigned long)invoked, SSHHDescribeObject(sender));
+    return invoked;
+}
+
+
 /// Restores visibility for a view that may be the original square/circle floating ball.
 static BOOL SSHHRestoreFloatingView(UIView *view, NSString *source) {
     if (![view isKindOfClass:[UIView class]]) {
@@ -572,9 +647,8 @@ static NSUInteger SSHHRestoreFloatingBallFromRuntime(UIViewController *controlle
     NSString *source = [NSString stringWithFormat:@"%s", reason ?: "unknown"];
     NSUInteger restored = 0;
 
-    /// Critical logic: enable the persisted switch used by the original floating-ball path.
-    [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"FloatingBall_key"];
-    [NSUserDefaults.standardUserDefaults synchronize];
+    /// Critical logic: enable the persisted switch used by the original floating-ball path in the recovered suite too.
+    SSHHSetRecoveredBool(YES, @"FloatingBall_key");
 
     id appDelegate = UIApplication.sharedApplication.delegate;
     SEL hudWindowSelector = NSSelectorFromString(@"hudwindow");
@@ -864,10 +938,8 @@ static void SSHHTryCloseDrawingFromController(UIViewController *controller) {
 static void SSHHTryToggleLiveModeFromController(UIViewController *controller) {
     SSHHLog(@"live mode discovery start controller=%@", SSHHDescribeObject(controller));
 
-    BOOL nextEnabled = ![NSUserDefaults.standardUserDefaults boolForKey:@"live_key"];
-    [NSUserDefaults.standardUserDefaults setBool:nextEnabled forKey:@"live_key"];
-    [NSUserDefaults.standardUserDefaults synchronize];
-    SSHHLog(@"live mode defaults live_key=%@", nextEnabled ? @"YES" : @"NO");
+    BOOL nextEnabled = !SSHHRecoveredBoolForKey(@"live_key");
+    SSHHSetRecoveredBool(nextEnabled, @"live_key");
 
     UISwitch *senderSwitch = [UISwitch new];
     senderSwitch.on = nextEnabled;
@@ -875,11 +947,17 @@ static void SSHHTryToggleLiveModeFromController(UIViewController *controller) {
     NSUInteger switchInvoked = SSHHInvokeKnownObjectAction(candidates, @"liveSwitchChanged:", senderSwitch, @"live mode");
     NSUInteger refreshInvoked = SSHHInvokeKnownNoArgAction(candidates, @"refreshLiveMode", @"live mode");
 
-    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"";
-    NSString *notificationName = [NSString stringWithFormat:@"%@.notification.hud.live-mode-changed", bundleID];
-    // Critical logic: notify the HUD process path recovered from Calculator strings without relying on UI reachability.
-    notify_post(notificationName.UTF8String);
-    SSHHLog(@"live mode notified name=%@ switchInvoked=%lu refreshInvoked=%lu", notificationName, (unsigned long)switchInvoked, (unsigned long)refreshInvoked);
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"com.apple.calculator";
+    NSArray<NSString *> *notificationNames = @[
+        [NSString stringWithFormat:@"%@.notification.hud.live-mode-changed", bundleID],
+        @"com.apple.calculator.notification.hud.live-mode-changed"
+    ];
+    for (NSString *notificationName in notificationNames) {
+        /// Critical logic: notify the HUD path recovered from strings after syncing the recovered preference suite.
+        notify_post(notificationName.UTF8String);
+        SSHHLog(@"live mode notified name=%@", notificationName);
+    }
+    SSHHLog(@"live mode finished enabled=%@ switchInvoked=%lu refreshInvoked=%lu", nextEnabled ? @"YES" : @"NO", (unsigned long)switchInvoked, (unsigned long)refreshInvoked);
 }
 
 
@@ -1004,18 +1082,31 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 
     SSHHHUDButtonTarget *overlayTarget = [SSHHHUDButtonTarget new];
     overlayTarget.controller = controller;
+    UIButton *floatingProxyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    floatingProxyButton.frame = CGRectMake(112.0, 4.0, 52.0, 52.0);
+    floatingProxyButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    floatingProxyButton.backgroundColor = [UIColor colorWithRed:1.0 green:0.55 blue:0.05 alpha:0.92];
+    floatingProxyButton.layer.cornerRadius = 26.0;
+    floatingProxyButton.layer.borderWidth = 2.0;
+    floatingProxyButton.layer.borderColor = UIColor.whiteColor.CGColor;
+    [floatingProxyButton setTitle:@"●" forState:UIControlStateNormal];
+    [floatingProxyButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+
     [overlayButton addTarget:overlayTarget action:@selector(sshh_launchHUDButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [floatingProxyButton addTarget:overlayTarget action:@selector(sshh_floatingBallButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [closeButton addTarget:overlayTarget action:@selector(sshh_closeDrawingButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [liveButton addTarget:overlayTarget action:@selector(sshh_toggleLiveModeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [logButton addTarget:overlayTarget action:@selector(sshh_closeLogButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [rootController.view addSubview:overlayButton];
+    [rootController.view addSubview:floatingProxyButton];
     [rootController.view addSubview:closeButton];
     [rootController.view addSubview:liveButton];
     [rootController.view addSubview:logButton];
     objc_setAssociatedObject(rootController, &SSHHHUDOverlayTargetKey, overlayTarget, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(rootController, &SSHHFloatingProxyButtonKey, floatingProxyButton, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     SSHHHUDOverlayWindow = overlayWindow;
-    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ closeButton=%@ liveButton=%@ logButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(liveButton), SSHHDescribeObject(logButton), SSHHDescribeObject(activeWindowScene));
+    SSHHLog(@"HUD top overlay buttons installed window=%@ startButton=%@ floatingProxy=%@ closeButton=%@ liveButton=%@ logButton=%@ scene=%@", SSHHDescribeObject(overlayWindow), SSHHDescribeObject(overlayButton), SSHHDescribeObject(floatingProxyButton), SSHHDescribeObject(closeButton), SSHHDescribeObject(liveButton), SSHHDescribeObject(logButton), SSHHDescribeObject(activeWindowScene));
 }
 
 %hook TSHWelcomeViewController
@@ -1268,6 +1359,24 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     SSHHLog(@"ViewController showFloatingBall intercepted self=%@", SSHHDescribeObject(self));
     %orig;
     SSHHRestoreFloatingBallFromRuntime((UIViewController *)self, "showFloatingBall");
+}
+
+/// Log the recovered original floating-ball tap handler to verify whether our proxy reaches the menu path.
+- (void)floatingBallClicked:(id)sender {
+    SSHHLog(@"ViewController floatingBallClicked: intercepted self=%@ sender=%@", SSHHDescribeObject(self), SSHHDescribeObject(sender));
+    %orig;
+}
+
+/// Log the original menu setup path because a missing menu explains a visible but ineffective floating ball.
+- (void)setupMenu {
+    SSHHLog(@"ViewController setupMenu intercepted self=%@", SSHHDescribeObject(self));
+    %orig;
+}
+
+/// Log forced floating-ball active state changes from the target itself.
+- (void)setFloatingBallActive:(BOOL)active {
+    SSHHLog(@"ViewController setFloatingBallActive: intercepted self=%@ active=%@", SSHHDescribeObject(self), active ? @"YES" : @"NO");
+    %orig(active);
 }
 
 %end
