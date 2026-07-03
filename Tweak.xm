@@ -769,7 +769,8 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
 - (void)viewDidAppear:(BOOL)animated {
     SSHHLog(@"LogViewController viewDidAppear animated=%@ self=%@", animated ? @"YES" : @"NO", SSHHDescribeObject(self));
     %orig;
-    if (self.view == nil || objc_getAssociatedObject(self, &SSHHLogCloseButtonKey) != nil) {
+    UIViewController *controller = (UIViewController *)self;
+    if (controller.view == nil || objc_getAssociatedObject(self, &SSHHLogCloseButtonKey) != nil) {
         return;
     }
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -781,7 +782,7 @@ static void SSHHInstallHUDButtonIfNeeded(id controllerObject) {
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     // Critical logic: call the app's recovered closePage action directly; no private state is modified here.
     [button addTarget:self action:@selector(closePage) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:button];
+    [controller.view addSubview:button];
     objc_setAssociatedObject(self, &SSHHLogCloseButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     SSHHLog(@"LogViewController emergency close button installed button=%@", SSHHDescribeObject(button));
 }
