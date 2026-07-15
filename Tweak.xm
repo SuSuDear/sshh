@@ -1,7 +1,8 @@
 //
 // sshh
-// 1) 原版激活绕过：欢迎页直进主页 + 底层校验返回 1
-// 2) 绘制启动诊断：记录 HUDThread/posix_spawn 结果，定位“点开启绘制就崩”
+// 1) 激活绕过
+// 2) 绘制 spawn 诊断
+// 3) 日志窗关闭解锁 + HUD 触摸路由修复
 //
 
 #import <Foundation/Foundation.h>
@@ -13,9 +14,13 @@
 #import <errno.h>
 #import <substrate.h>
 
-// IDA：primary @ 0x10008C904 / secondary @ 0x10008C7A8
+// 底层激活校验
 static const uintptr_t kPrimaryCheckFileOff   = 0x8C904;
 static const uintptr_t kSecondaryCheckFileOff = 0x8C7A8;
+// HID hitTest 目标窗口全局：qword_1010C5390
+static const uintptr_t kHitWindowGlobalOff    = 0x10C5390;
+// sub_1000302DC: 把 windows.firstObject 塞进全局
+static const uintptr_t kSetHitWindowFileOff   = 0x302DC;
 static const uintptr_t kPreferredBase         = 0x100000000ULL;
 
 #ifndef SSHH_LOG
@@ -28,7 +33,7 @@ static const uintptr_t kPreferredBase         = 0x100000000ULL;
 #define SSHHLog(fmt, ...)
 #endif
 
-#pragma mark - 最小 ObjC 声明
+#pragma mark - 声明
 
 @interface TSHWelcomeViewController : UIViewController
 - (BOOL)tsh_didEnterHome;
@@ -60,12 +65,86 @@ static const uintptr_t kPreferredBase         = 0x100000000ULL;
 - (void)setCanCloseLogPanel:(BOOL)value;
 - (UIButton *)closeButton;
 - (UILabel *)titleLabel;
+- (UIView *)containerView;
+- (UITextView *)textView;
 - (void)closeTapped;
 - (void)hideLogMenuAnimated:(BOOL)animated;
 - (void)setLogSystemActive:(BOOL)active;
 @end
 
-#pragma mark - 底层激活检查 hook
+@interface HUDDelegate : NSObject
+- (BOOL)application:(id)app didFinishLaunchingWithOptions:(id)opts;
+- (UIWindow *)logwindow;
+- (UIWindow *)hudwindow;
+- (UIViewController *)logRootViewController;
+@end
+
+@interface LOGRootWindow : UIWindow
+@end
+
+@interface HUDMainWindow : UIWindow
+@end
+
+#pragma mark - 环境
+
+static BOOL SSHHIsHUDProcess(void) {
+    NSArray *args = NSProcessInfo.processInfo.arguments ?: @[];
+    for (NSString *a in args) {
+        if ([a isEqualToString:@"start"] || [a isEqualToString:@"Finish"] || [a isEqualToString:@"examine"]) {
+            return YES;
+        }
+    }
+    // HUD 子进程通常 uid=0
+    if (geteuid() == 0 && args.count >= 2) return YES;
+    return NO;
+}
+
+static BOOL SSHHIsCalculatorHost(void) {
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    NSString *exe = NSBundle.mainBundle.executablePath.lastPathComponent ?: @"";
+    return [bid isEqualToString:@"com.apple.calculator"] || [exe isEqualToString:@"Calculator"];
+}
+
+static BOOL SSHHFindMainImage(const char **outName, const struct mach_header **outHeader, intptr_t *outSlide) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        if (strstr(name, "sshh") != NULL) continue;
+        BOOL hit = NO;
+        if (strstr(name, "/Calculator.app/Calculator") != NULL) hit = YES;
+        if (!hit && strstr(name, "PersistenceHelper") != NULL && strstr(name, ".dylib") == NULL) hit = YES;
+        if (!hit) continue;
+        *outName = name;
+        *outHeader = _dyld_get_image_header(i);
+        *outSlide = _dyld_get_image_vmaddr_slide(i);
+        return YES;
+    }
+    if (count > 0) {
+        *outName = _dyld_get_image_name(0);
+        *outHeader = _dyld_get_image_header(0);
+        *outSlide = _dyld_get_image_vmaddr_slide(0);
+        return (*outHeader != NULL);
+    }
+    return NO;
+}
+
+static intptr_t gSlide = 0;
+static BOOL gSlideReady = NO;
+
+static BOOL SSHHEnsureSlide(void) {
+    if (gSlideReady) return YES;
+    const char *name = NULL;
+    const struct mach_header *header = NULL;
+    intptr_t slide = 0;
+    if (!SSHHFindMainImage(&name, &header, &slide)) return NO;
+    gSlide = slide;
+    gSlideReady = YES;
+    SSHHLog("image=%s slide=0x%lx", name ? name : "(null)", (unsigned long)slide);
+    return YES;
+}
+
+#pragma mark - 激活校验 hook
 
 typedef int (*ZCCheckFn)(void);
 static ZCCheckFn orig_primary_check = NULL;
@@ -76,69 +155,25 @@ static int hooked_primary_check(void) {
     SSHHLog("primary check -> 1");
     return 1;
 }
-
 static int hooked_secondary_check(void) {
     SSHHLog("secondary check -> 1");
     return 1;
 }
 
-static BOOL SSHHFindMainImage(const char **outName, const struct mach_header **outHeader, intptr_t *outSlide) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        if (strstr(name, "sshh") != NULL) continue;
-
-        BOOL hit = NO;
-        if (strstr(name, "/Calculator.app/Calculator") != NULL) hit = YES;
-        if (!hit && strstr(name, "PersistenceHelper") != NULL && strstr(name, ".dylib") == NULL) hit = YES;
-        if (!hit) continue;
-
-        *outName = name;
-        *outHeader = _dyld_get_image_header(i);
-        *outSlide = _dyld_get_image_vmaddr_slide(i);
-        return YES;
-    }
-
-    if (count > 0) {
-        *outName = _dyld_get_image_name(0);
-        *outHeader = _dyld_get_image_header(0);
-        *outSlide = _dyld_get_image_vmaddr_slide(0);
-        return (*outHeader != NULL);
-    }
-    return NO;
-}
-
 static BOOL SSHHInstallFunctionHooks(void) {
     if (gFunctionHooksInstalled) return YES;
-
-    const char *name = NULL;
-    const struct mach_header *header = NULL;
-    intptr_t slide = 0;
-    if (!SSHHFindMainImage(&name, &header, &slide)) {
-        SSHHLog("main image not found");
-        return NO;
-    }
-
-    uintptr_t primary = kPreferredBase + kPrimaryCheckFileOff + (uintptr_t)slide;
-    uintptr_t secondary = kPreferredBase + kSecondaryCheckFileOff + (uintptr_t)slide;
-
-    SSHHLog("image=%s slide=0x%lx", name ? name : "(null)", (unsigned long)slide);
+    if (!SSHHEnsureSlide()) return NO;
+    uintptr_t primary = kPreferredBase + kPrimaryCheckFileOff + (uintptr_t)gSlide;
+    uintptr_t secondary = kPreferredBase + kSecondaryCheckFileOff + (uintptr_t)gSlide;
     SSHHLog("hook primary=%p secondary=%p", (void *)primary, (void *)secondary);
-    SSHHLog("insn primary=0x%08x secondary=0x%08x",
-            *(uint32_t *)primary, *(uint32_t *)secondary);
-
     MSHookFunction((void *)primary, (void *)&hooked_primary_check, (void **)&orig_primary_check);
     MSHookFunction((void *)secondary, (void *)&hooked_secondary_check, (void **)&orig_secondary_check);
-
     gFunctionHooksInstalled = YES;
-    SSHHLog("function hooks installed");
     return YES;
 }
 
-#pragma mark - posix_spawn 诊断（绘制子进程入口）
+#pragma mark - posix_spawn 诊断
 
-// 原版：posix_spawn(path=self, argv=["...","start"|"Finish"|"examine"], persona=99)
 static int (*orig_posix_spawn)(pid_t *pid, const char *path,
                                const posix_spawn_file_actions_t *file_actions,
                                const posix_spawnattr_t *attrp,
@@ -160,232 +195,289 @@ static int hooked_posix_spawn(pid_t *pid, const char *path,
     NSString *argvText = SSHHJoinArgv(argv);
     SSHHLog("posix_spawn ENTER path=%s argv=[%@] uid=%d euid=%d",
             path ? path : "(null)", argvText, (int)getuid(), (int)geteuid());
-
     int rc = orig_posix_spawn(pid, path, file_actions, attrp, argv, envp);
     if (rc == 0) {
-        SSHHLog("posix_spawn OK pid=%d path=%s argv=[%@]",
-                pid ? (int)*pid : -1, path ? path : "(null)", argvText);
+        SSHHLog("posix_spawn OK pid=%d argv=[%@]", pid ? (int)*pid : -1, argvText);
     } else {
-        SSHHLog("posix_spawn FAIL rc=%d errno=%d(%s) path=%s argv=[%@]",
-                rc, errno, strerror(errno), path ? path : "(null)", argvText);
+        SSHHLog("posix_spawn FAIL rc=%d errno=%d(%s) argv=[%@]",
+                rc, errno, strerror(errno), argvText);
     }
     return rc;
 }
 
 static void SSHHInstallPosixSpawnHook(void) {
-    // 直接 hook 符号，覆盖 StartAndEnd / CheckHudThreadState 两条路径
     MSHookFunction((void *)posix_spawn, (void *)hooked_posix_spawn, (void **)&orig_posix_spawn);
-    SSHHLog("posix_spawn hook installed orig=%p", orig_posix_spawn);
+    SSHHLog("posix_spawn hook installed");
 }
 
-#pragma mark - 欢迎页激活绕过
+#pragma mark - 欢迎页
 
 static void SSHHForceEnterHome(TSHWelcomeViewController *self, const char *reason) {
     if (!self) return;
-
-    if ([self respondsToSelector:@selector(tsh_didEnterHome)] && [self tsh_didEnterHome]) {
-        SSHHLog("enterHome skip (already home) reason=%s", reason);
-        return;
-    }
-
+    if ([self respondsToSelector:@selector(tsh_didEnterHome)] && [self tsh_didEnterHome]) return;
     if ([self respondsToSelector:@selector(tsh_statusLabel)]) {
         UILabel *label = [self tsh_statusLabel];
-        if ([label isKindOfClass:[UILabel class]]) {
-            label.text = @"激活成功，正在进入…";
-        }
+        if ([label isKindOfClass:[UILabel class]]) label.text = @"激活成功，正在进入…";
     }
-
     if ([self respondsToSelector:@selector(tsh_loading)]) {
         UIActivityIndicatorView *loading = [self tsh_loading];
-        if ([loading respondsToSelector:@selector(stopAnimating)]) {
-            [loading stopAnimating];
-        }
+        if ([loading respondsToSelector:@selector(stopAnimating)]) [loading stopAnimating];
     }
-
     if ([self respondsToSelector:@selector(ToHome:)]) {
-        SSHHLog("force ToHome:YES reason=%s", reason);
+        SSHHLog("force ToHome reason=%s", reason);
         [self ToHome:YES];
-        return;
     }
-
-    SSHHLog("ToHome: missing, reason=%s", reason);
 }
 
 %hook TSHWelcomeViewController
-
 - (void)tsh_checkActivationAndEnterHome {
     SSHHLog("tsh_checkActivationAndEnterHome hit");
     SSHHForceEnterHome(self, "checkActivation");
 }
-
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    SSHHLog("welcome viewDidAppear animated=%d", (int)animated);
-
     __weak TSHWelcomeViewController *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        TSHWelcomeViewController *strongSelf = weakSelf;
-        if (!strongSelf) return;
-        SSHHForceEnterHome(strongSelf, "viewDidAppear");
+        SSHHForceEnterHome(weakSelf, "viewDidAppear");
     });
 }
-
 %end
 
-#pragma mark - 绘制开关诊断
+#pragma mark - 绘制按钮诊断
 
 %hook HUDThread
-
-// YES=start 子进程 / NO=Finish 杀进程
 + (void)StartAndEnd:(BOOL)start {
-    NSString *pidPath = nil;
-    NSString *statePath = nil;
-    if ([objc_getClass("HUDConfig") respondsToSelector:@selector(GET_PID_PATH)]) {
-        pidPath = [objc_getClass("HUDConfig") GET_PID_PATH];
-    }
-    if ([objc_getClass("HUDConfig") respondsToSelector:@selector(GET_STATE_PATH)]) {
-        statePath = [objc_getClass("HUDConfig") GET_STATE_PATH];
-    }
-
-    SSHHLog("HUDThread StartAndEnd:%d pidPath=%@ statePath=%@ exe=%@",
-            (int)start, pidPath, statePath, NSBundle.mainBundle.executablePath);
-
-    @try {
-        %orig;
-        SSHHLog("HUDThread StartAndEnd:%d returned", (int)start);
-    } @catch (NSException *ex) {
-        SSHHLog("HUDThread StartAndEnd:%d EXCEPTION %@ reason=%@",
-                (int)start, ex.name, ex.reason);
-        @throw;
-    }
-
-    // 启动后短延迟检查 pid 文件 / state 文件是否生成
-    if (start) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            NSFileManager *fm = NSFileManager.defaultManager;
-            BOOL pidExists = pidPath ? [fm fileExistsAtPath:pidPath] : NO;
-            BOOL stateExists = statePath ? [fm fileExistsAtPath:statePath] : NO;
-            NSString *pidContent = pidExists ? [NSString stringWithContentsOfFile:pidPath encoding:NSUTF8StringEncoding error:nil] : nil;
-            SSHHLog("HUD post-start check pidExists=%d pid=%@ stateExists=%d",
-                    (int)pidExists, pidContent, (int)stateExists);
-        });
-    }
+    SSHHLog("HUDThread StartAndEnd:%d euid=%d", (int)start, (int)geteuid());
+    %orig;
+    SSHHLog("HUDThread StartAndEnd:%d returned", (int)start);
 }
-
 + (BOOL)CheckHudThreadState:(NSString *)arg {
     BOOL ret = %orig;
-    SSHHLog("HUDThread CheckHudThreadState:%@ -> %d", arg, (int)ret);
+    SSHHLog("CheckHudThreadState:%@ -> %d", arg, (int)ret);
     return ret;
 }
-
 %end
 
 %hook ViewController
-
-// 主页“开启绘制”按钮
 - (void)startButtonTapped {
-    BOOL running = NO;
-    if ([self respondsToSelector:@selector(GetRunning:)]) {
-        running = [self GetRunning:@"examine"];
-    }
-    SSHHLog("startButtonTapped running(examine)=%d", (int)running);
+    BOOL running = [self respondsToSelector:@selector(GetRunning:)] ? [self GetRunning:@"examine"] : NO;
+    SSHHLog("startButtonTapped running=%d", (int)running);
     %orig;
-    SSHHLog("startButtonTapped returned");
 }
-
 %end
-
 
 #pragma mark - 日志窗关闭解锁
 
-// 原版：加载中 canCloseLogPanel=NO，closeTapped 直接 return
-// 现象：标题“等待加载完成后再关闭日志”，X 半透明且点不动
-// 处理：强制允许关闭，并恢复按钮可点状态
 static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
     if (!self) return;
-
     if ([self respondsToSelector:@selector(setCanCloseLogPanel:)]) {
         [self setCanCloseLogPanel:YES];
     }
-
-    UIButton *btn = nil;
-    if ([self respondsToSelector:@selector(closeButton)]) {
-        btn = [self closeButton];
-    }
+    UIButton *btn = [self respondsToSelector:@selector(closeButton)] ? [self closeButton] : nil;
     if ([btn isKindOfClass:[UIButton class]]) {
         btn.enabled = YES;
         btn.userInteractionEnabled = YES;
         btn.alpha = 1.0;
     }
+    UIView *container = [self respondsToSelector:@selector(containerView)] ? [self containerView] : nil;
+    if (container) {
+        container.userInteractionEnabled = YES;
+        container.hidden = NO;
+        container.alpha = 1.0;
+    }
+    UITextView *tv = [self respondsToSelector:@selector(textView)] ? (UITextView *)[self textView] : nil;
+    if ([tv isKindOfClass:[UITextView class]]) {
+        tv.userInteractionEnabled = YES;
+        tv.editable = NO;
+        tv.selectable = YES;
+    }
+    self.view.userInteractionEnabled = YES;
 
     if ([self respondsToSelector:@selector(titleLabel)]) {
         UILabel *title = [self titleLabel];
         if ([title isKindOfClass:[UILabel class]]) {
-            // 不覆盖“加载成功/失败”最终态，只在等待态改文案
             NSString *cur = title.text ?: @"";
             if ([cur containsString:@"等待"] || [cur containsString:@"关闭日志"] || cur.length == 0) {
                 title.text = @"日志（可随时关闭）";
             }
         }
     }
-
-    SSHHLog("unlock close button reason=%s btn=%p enabled=%d alpha=%.2f",
-            reason, btn, (int)btn.enabled, btn ? btn.alpha : -1.0);
+    SSHHLog("unlock close reason=%s btn=%p enabled=%d", reason, btn, (int)btn.enabled);
 }
 
 %hook LogViewController
-
-// 始终允许 closeTapped 通过
 - (BOOL)canCloseLogPanel {
-    BOOL orig = %orig;
-    if (!orig) {
-        SSHHLog("canCloseLogPanel forced YES (orig=NO)");
-    }
     return YES;
 }
-
 - (void)setCanCloseLogPanel:(BOOL)value {
-    // 原版可能反复设回 NO；统一抬到 YES
-    SSHHLog("setCanCloseLogPanel:%d -> YES", (int)value);
     %orig(YES);
 }
-
 - (void)viewDidLoad {
     %orig;
-    SSHHLog("LogViewController viewDidLoad");
     SSHHUnlockCloseButton(self, "viewDidLoad");
-
     __weak LogViewController *weakSelf = self;
-    // UI 异步布局后 dual-unlock，避免 setupUI 后半段又 setEnabled:NO
-    dispatch_async(dispatch_get_main_queue(), ^{
-        SSHHUnlockCloseButton(weakSelf, "viewDidLoad.async");
+    dispatch_async(dispatch_get_main_queue(), ^{ SSHHUnlockCloseButton(weakSelf, "vdl.async"); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SSHHUnlockCloseButton(weakSelf, "vdl.0.3s");
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        SSHHUnlockCloseButton(weakSelf, "viewDidLoad.0.5s");
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        SSHHUnlockCloseButton(weakSelf, "viewDidLoad.1.5s");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SSHHUnlockCloseButton(weakSelf, "vdl.1s");
     });
 }
-
-// 日志刷新时原版可能再次禁用关闭；这里每次状态更新后解锁
 - (void)updateStatusForLogLine:(id)line {
     %orig;
-    SSHHUnlockCloseButton(self, "updateStatusForLogLine");
+    SSHHUnlockCloseButton(self, "updateStatus");
 }
-
 - (void)closeTapped {
-    SSHHLog("closeTapped hit canClose=%d",
-            (int)([self respondsToSelector:@selector(canCloseLogPanel)] ? [self canCloseLogPanel] : -1));
-    // 再保险：点之前强制解锁
+    SSHHLog("closeTapped");
     SSHHUnlockCloseButton(self, "closeTapped");
     %orig;
 }
+%end
 
+#pragma mark - HUD 触摸路由修复
+
+// 原版 HID 回调只 hitTest windows.firstObject
+// 创建顺序/层级下 firstObject 常是 HUDMainWindow（绘制窗，交互关闭）→ 触摸全丢
+// 这里强制把 hitTest 目标设为 LOGRootWindow
+
+static void (*orig_set_hit_window)(id a1) = NULL;
+static BOOL gHitWindowHookInstalled = NO;
+
+static UIWindow *SSHHFindLogWindow(void) {
+    Class logCls = objc_getClass("LOGRootWindow");
+    UIApplication *app = UIApplication.sharedApplication;
+    // iOS 15+ windows 可能空，尽量扫
+    NSArray *windows = nil;
+    if ([app respondsToSelector:@selector(windows)]) {
+        windows = app.windows;
+    }
+    for (UIWindow *w in windows) {
+        if (logCls && [w isKindOfClass:logCls]) return w;
+        // 兜底：rootVC 是 LogViewController
+        if ([NSStringFromClass([w.rootViewController class]) isEqualToString:@"LogViewController"]) return w;
+    }
+    return nil;
+}
+
+static void SSHHForceHitTestWindow(const char *reason) {
+    if (!SSHHEnsureSlide()) return;
+    UIWindow *log = SSHHFindLogWindow();
+    if (!log) {
+        SSHHLog("force hit window: log not found (%s)", reason);
+        return;
+    }
+    id *slot = (id *)(kPreferredBase + kHitWindowGlobalOff + (uintptr_t)gSlide);
+    id old = *slot;
+    if (old == (id)log) {
+        SSHHLog("hit window already LOG (%s) %p", reason, log);
+        return;
+    }
+    *slot = (id)objc_retain(log);
+    if (old) objc_release(old);
+    SSHHLog("hit window forced LOG (%s) %p old=%p", reason, log, old);
+}
+
+static void hooked_set_hit_window(id a1) {
+    // 先走原逻辑，再覆盖为 log 窗
+    if (orig_set_hit_window) orig_set_hit_window(a1);
+    SSHHForceHitTestWindow("set_hit_window");
+}
+
+static void SSHHInstallHitWindowHook(void) {
+    if (gHitWindowHookInstalled) return;
+    if (!SSHHEnsureSlide()) return;
+    void *fn = (void *)(kPreferredBase + kSetHitWindowFileOff + (uintptr_t)gSlide);
+    MSHookFunction(fn, (void *)hooked_set_hit_window, (void **)&orig_set_hit_window);
+    gHitWindowHookInstalled = YES;
+    SSHHLog("hit-window hook installed fn=%p", fn);
+}
+
+static void SSHHFixHUDWindows(const char *reason) {
+    UIWindow *log = SSHHFindLogWindow();
+    Class hudCls = objc_getClass("HUDMainWindow");
+    UIWindow *hud = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (hudCls && [w isKindOfClass:hudCls]) { hud = w; break; }
+    }
+
+    // 日志窗提到最高，绘制窗可显示但不可点
+    if (log) {
+        // 原版 log=statusBar-1 / hud=statusBar+1，自定义 HID 又只测 firstObject，极易点穿
+        log.windowLevel = 10000001.0;
+        log.hidden = NO;
+        log.userInteractionEnabled = YES;
+        [log makeKeyAndVisible];
+        if ([log.rootViewController isKindOfClass:objc_getClass("LogViewController")]) {
+            SSHHUnlockCloseButton((LogViewController *)log.rootViewController, reason);
+        }
+    }
+    if (hud) {
+        hud.windowLevel = 10000000.0; // 仍可盖住游戏，但低于 log
+        hud.userInteractionEnabled = NO;
+        hud.rootViewController.view.userInteractionEnabled = NO;
+    }
+
+    SSHHForceHitTestWindow(reason);
+    SSHHLog("fix HUD windows reason=%s log=%p level=%.1f hud=%p",
+            reason, log, log.windowLevel, hud);
+}
+
+%hook HUDMainWindow
+// 系统命中测试：绘制窗永不吃触摸
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    return nil;
+}
+- (BOOL)_ignoresHitTest {
+    return YES;
+}
+- (BOOL)userInteractionEnabled {
+    return NO;
+}
+%end
+
+%hook LOGRootWindow
+- (BOOL)_ignoresHitTest {
+    return NO;
+}
+- (BOOL)userInteractionEnabled {
+    return YES;
+}
+// 保证日志窗可点
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = %orig;
+    if (!v) {
+        // 兜底：点在窗口内就返回 rootView
+        if (CGRectContainsPoint(self.bounds, point)) {
+            return self.rootViewController.view ?: self;
+        }
+    }
+    return v;
+}
+%end
+
+%hook HUDDelegate
+- (BOOL)application:(id)app didFinishLaunchingWithOptions:(id)opts {
+    BOOL ret = %orig;
+    SSHHLog("HUDDelegate didFinishLaunching");
+    // 窗口刚建完立刻修层级/命中
+    SSHHFixHUDWindows("didFinishLaunching");
+    dispatch_async(dispatch_get_main_queue(), ^{ SSHHFixHUDWindows("didFinish.async"); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SSHHFixHUDWindows("didFinish.0.2s");
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SSHHFixHUDWindows("didFinish.1s");
+    });
+    // 利用过程中再刷几次，防止状态刷新把按钮打回 disabled
+    for (int i = 2; i <= 8; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SSHHFixHUDWindows("keepalive");
+        });
+    }
+    return ret;
+}
 %end
 
 #pragma mark - ctor
@@ -395,33 +487,34 @@ static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
         NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"(null)";
         NSString *exe = NSBundle.mainBundle.executablePath ?: @"(null)";
         NSArray *args = NSProcessInfo.processInfo.arguments ?: @[];
-        SSHHLog("loaded bid=%@ exe=%@ args=%@ uid=%d euid=%d",
-                bid, exe, args, (int)getuid(), (int)geteuid());
+        BOOL isHUD = SSHHIsHUDProcess();
+        BOOL isCalc = SSHHIsCalculatorHost();
+        SSHHLog("loaded bid=%@ exe=%@ args=%@ uid=%d euid=%d hud=%d",
+                bid, exe, args, (int)getuid(), (int)geteuid(), (int)isHUD);
 
-        BOOL isCalc = [bid isEqualToString:@"com.apple.calculator"] ||
-                      [exe.lastPathComponent isEqualToString:@"Calculator"];
-        if (!isCalc) {
-            SSHHLog("not calculator host, keep only spawn log if injected");
+        if (isCalc && !isHUD) {
+            // 主界面：激活绕过 + spawn 诊断
+            SSHHInstallFunctionHooks();
+            SSHHInstallPosixSpawnHook();
         }
 
-        // 1) 激活绕过
-        if (isCalc) {
-            if (!SSHHInstallFunctionHooks()) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    SSHHInstallFunctionHooks();
+        if (isHUD || isCalc) {
+            // HUD 子进程：触摸/关闭修复
+            if (isHUD) {
+                SSHHInstallHitWindowHook();
+                // 延迟再装一次，防 image slide 尚未稳定
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    SSHHInstallHitWindowHook();
+                    SSHHFixHUDWindows("hud.ctor");
                 });
             }
         }
 
-        // 2) 绘制 spawn 诊断（主进程 + 若子进程也注入则同样可见）
-        SSHHInstallPosixSpawnHook();
-
-        Class welcomeCls = objc_getClass("TSHWelcomeViewController");
-        Class hudThreadCls = objc_getClass("HUDThread");
-        Class vcCls = objc_getClass("ViewController");
-        Class logVCCls = objc_getClass("LogViewController");
-        SSHHLog("classes welcome=%p HUDThread=%p ViewController=%p LogViewController=%p", welcomeCls, hudThreadCls, vcCls, logVCCls);
-        SSHHLog("init done");
+        SSHHLog("classes LogVC=%p HUDDelegate=%p LOGRoot=%p HUDMain=%p",
+                objc_getClass("LogViewController"),
+                objc_getClass("HUDDelegate"),
+                objc_getClass("LOGRootWindow"),
+                objc_getClass("HUDMainWindow"));
+        SSHHLog("init done v0.1.3");
     }
 }

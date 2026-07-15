@@ -37,3 +37,18 @@ log stream --predicate 'eventMessage CONTAINS "[sshh]"' --level debug
 - `HUDThread StartAndEnd:1`
 - `posix_spawn ENTER/OK/FAIL`
 - `HUD post-start check pidExists=...`
+
+
+## 0.1.3 HUD 触摸修复
+
+现象：日志窗看得见但点不了/滑不动。
+
+原因：
+1. 加载中 `canCloseLogPanel=NO`，X 被禁用
+2. 自定义 HID 只 `hitTest(windows.firstObject)`，firstObject 常是不可交互的 `HUDMainWindow`
+
+修复：
+- 强制关闭解锁
+- 提升 `LOGRootWindow` 层级
+- `HUDMainWindow hitTest` 恒返回 nil
+- 强制 HID 命中窗口为 `LOGRootWindow`
