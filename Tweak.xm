@@ -4,6 +4,12 @@
 // 2) 绘制 spawn 诊断
 // 3) 日志窗关闭解锁 + HUD 触摸路由修复
 //
+// v0.1.5 关键修复：
+// 原版 HIDDeliverTouchOnMain 每次触摸都对全局 hit 窗口 hitTest，
+// 该全局只在 once 里写成 windows.firstObject（常为 HUDMainWindow）。
+// 仅 hook set_hit_window 不够稳：once 时序/晚注入/旧值残留都会失败。
+// 现在在每次 deliver touch 入口强制把全局改成 LOGRootWindow。
+//
 
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -20,8 +26,10 @@ static const uintptr_t kPrimaryCheckFileOff   = 0x8C904;
 static const uintptr_t kSecondaryCheckFileOff = 0x8C7A8;
 // HID hitTest 目标窗口全局：qword_1010C5390
 static const uintptr_t kHitWindowGlobalOff    = 0x10C5390;
-// sub_1000302DC: 把 windows.firstObject 塞进全局
+// sub_1000302DC: 把 windows.firstObject 塞进全局（once 回调）
 static const uintptr_t kSetHitWindowFileOff   = 0x302DC;
+// sub_100030134: HID 主线程投递触摸，每次触摸都会走这里
+static const uintptr_t kDeliverTouchFileOff   = 0x30134;
 static const uintptr_t kPreferredBase         = 0x100000000ULL;
 
 #ifndef SSHH_LOG
@@ -280,6 +288,7 @@ static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
         btn.enabled = YES;
         btn.userInteractionEnabled = YES;
         btn.alpha = 1.0;
+        btn.hidden = NO;
     }
     UIView *container = [self respondsToSelector:@selector(containerView)] ? [self containerView] : nil;
     if (container) {
@@ -292,8 +301,10 @@ static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
         tv.userInteractionEnabled = YES;
         tv.editable = NO;
         tv.selectable = YES;
+        tv.scrollEnabled = YES;
     }
     self.view.userInteractionEnabled = YES;
+    self.view.hidden = NO;
 
     if ([self respondsToSelector:@selector(titleLabel)]) {
         UILabel *title = [self titleLabel];
@@ -304,7 +315,8 @@ static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
             }
         }
     }
-    SSHHLog("unlock close reason=%s btn=%p enabled=%d", reason, btn, (int)btn.enabled);
+    SSHHLog("unlock close reason=%s btn=%p enabled=%d alpha=%.2f",
+            reason, btn, (int)btn.enabled, btn ? btn.alpha : -1.0);
 }
 
 %hook LogViewController
@@ -326,6 +338,10 @@ static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
         SSHHUnlockCloseButton(weakSelf, "vdl.1s");
     });
 }
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    SSHHUnlockCloseButton(self, "viewDidAppear");
+}
 - (void)updateStatusForLogLine:(id)line {
     %orig;
     SSHHUnlockCloseButton(self, "updateStatus");
@@ -339,57 +355,131 @@ static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
 
 #pragma mark - HUD 触摸路由修复
 
-// 原版 HID 回调只 hitTest windows.firstObject
-// 创建顺序/层级下 firstObject 常是 HUDMainWindow（绘制窗，交互关闭）→ 触摸全丢
-// 这里强制把 hitTest 目标设为 LOGRootWindow
+// 原版链路：
+// BKSHIDEventRegisterEventCallback -> HIDDeliverTouchOnMain
+//   OnceInitHitTestWindow -> SetHitTestWindowFromFirstObject
+//   view = [qword_1010C5390 hitTest:point withEvent:nil]
+//   [TSEventFetcher ... inWindow:qword_1010C5390 onView:view]
+//
+// firstObject 高概率是 HUDMainWindow（level 更高且 _ignoresHitTest=YES）
+// → 日志/关闭按钮永远收不到合成触摸
 
 static void (*orig_set_hit_window)(id a1) = NULL;
+static void (*orig_deliver_touch)(void *ctx) = NULL;
 static BOOL gHitWindowHookInstalled = NO;
+static BOOL gDeliverTouchHookInstalled = NO;
+static NSUInteger gDeliverTouchCount = 0;
+static NSUInteger gForceLogCount = 0;
+
+static UIWindow *SSHHFindHUDWindow(void) {
+    Class hudCls = objc_getClass("HUDMainWindow");
+    id del = UIApplication.sharedApplication.delegate;
+    if ([del respondsToSelector:@selector(hudwindow)]) {
+        UIWindow *w = [del hudwindow];
+        if (w) return w;
+    }
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (hudCls && [w isKindOfClass:hudCls]) return w;
+        if ([NSStringFromClass(w.class) isEqualToString:@"HUDMainWindow"]) return w;
+    }
+    return nil;
+}
 
 static UIWindow *SSHHFindLogWindow(void) {
     Class logCls = objc_getClass("LOGRootWindow");
+
+    // 1) 优先走 HUDDelegate 持有的强引用，不依赖 windows 顺序
+    id del = UIApplication.sharedApplication.delegate;
+    if ([del respondsToSelector:@selector(logwindow)]) {
+        UIWindow *w = [del logwindow];
+        if (w) return w;
+    }
+
     UIApplication *app = UIApplication.sharedApplication;
-    // iOS 15+ windows 可能空，尽量扫
     NSArray *windows = nil;
     if ([app respondsToSelector:@selector(windows)]) {
         windows = app.windows;
     }
     for (UIWindow *w in windows) {
         if (logCls && [w isKindOfClass:logCls]) return w;
+        if ([NSStringFromClass(w.class) isEqualToString:@"LOGRootWindow"]) return w;
         // 兜底：rootVC 是 LogViewController
         if ([NSStringFromClass([w.rootViewController class]) isEqualToString:@"LogViewController"]) return w;
     }
     return nil;
 }
 
-static void SSHHForceHitTestWindow(const char *reason) {
-    if (!SSHHEnsureSlide()) return;
+// 读取当前全局 hit 窗口指针（不 retain）
+static UIWindow *SSHHGetGlobalHitWindow(void) {
+    if (!SSHHEnsureSlide()) return nil;
+    void **slot = (void **)(uintptr_t)(kPreferredBase + kHitWindowGlobalOff + (uintptr_t)gSlide);
+    void *cur = *slot;
+    if (!cur) return nil;
+    return (__bridge UIWindow *)cur;
+}
+
+// 把 LOGRootWindow 强行写入全局 hit 槽位
+// 注意：原二进制对该槽位按 strong 语义持有，必须 CFRetain/CFRelease 配对
+static BOOL SSHHForceHitTestWindow(const char *reason, BOOL verbose) {
+    if (!SSHHEnsureSlide()) return NO;
     UIWindow *log = SSHHFindLogWindow();
     if (!log) {
-        SSHHLog("force hit window: log not found (%s)", reason);
-        return;
+        if (verbose) SSHHLog("force hit window: log not found (%s)", reason);
+        return NO;
     }
-    // 原二进制全局 slot 存 strong UIWindow*。
-    // ARC 禁止把整数地址直接转成 id*，也不能裸用 objc_retain/objc_release。
-    // 用 void** + CFRetain/CFRelease 写全局，语义等价于强引用替换。
+
     void **slot = (void **)(uintptr_t)(kPreferredBase + kHitWindowGlobalOff + (uintptr_t)gSlide);
     void *old = *slot;
     if (old == (__bridge void *)log) {
-        SSHHLog("hit window already LOG (%s) %p", reason, log);
-        return;
+        if (verbose) {
+            SSHHLog("hit window already LOG (%s) %p class=%@",
+                    reason, log, NSStringFromClass(log.class));
+        }
+        return YES;
     }
+
     CFRetain((__bridge CFTypeRef)log);
     *slot = (__bridge void *)log;
     if (old) {
         CFRelease((CFTypeRef)old);
     }
-    SSHHLog("hit window forced LOG (%s) %p old=%p", reason, log, old);
+    gForceLogCount++;
+    if (verbose || (gForceLogCount <= 8) || ((gForceLogCount % 120) == 0)) {
+        SSHHLog("hit window forced LOG (%s) %p old=%p class=%@ count=%lu",
+                reason, log, old, NSStringFromClass(log.class),
+                (unsigned long)gForceLogCount);
+    }
+    return YES;
 }
 
 static void hooked_set_hit_window(id a1) {
-    // 先走原逻辑，再覆盖为 log 窗
+    // 先走原逻辑（写 firstObject），再覆盖为 log 窗
     if (orig_set_hit_window) orig_set_hit_window(a1);
-    SSHHForceHitTestWindow("set_hit_window");
+    SSHHForceHitTestWindow("set_hit_window", YES);
+}
+
+// 每次触摸投递前强制全局窗口 = LOGRootWindow
+// 这是修复点不了的核心：比 only-once 的 set_hit_window 更稳
+static void hooked_deliver_touch(void *ctx) {
+    gDeliverTouchCount++;
+
+    UIWindow *before = SSHHGetGlobalHitWindow();
+    BOOL forced = SSHHForceHitTestWindow("deliver_touch", NO);
+    UIWindow *after = SSHHGetGlobalHitWindow();
+
+    // 低频诊断，避免刷爆日志
+    BOOL shouldLog = (gDeliverTouchCount <= 12) || ((gDeliverTouchCount % 180) == 0);
+    if (shouldLog) {
+        NSString *bcls = before ? NSStringFromClass(before.class) : @"(null)";
+        NSString *acls = after ? NSStringFromClass(after.class) : @"(null)";
+        SSHHLog("deliver_touch #%lu forced=%d before=%@ after=%@ logFound=%d",
+                (unsigned long)gDeliverTouchCount,
+                (int)forced, bcls, acls, (int)(SSHHFindLogWindow() != nil));
+    }
+
+    if (orig_deliver_touch) {
+        orig_deliver_touch(ctx);
+    }
 }
 
 static void SSHHInstallHitWindowHook(void) {
@@ -401,34 +491,49 @@ static void SSHHInstallHitWindowHook(void) {
     SSHHLog("hit-window hook installed fn=%p", fn);
 }
 
+static void SSHHInstallDeliverTouchHook(void) {
+    if (gDeliverTouchHookInstalled) return;
+    if (!SSHHEnsureSlide()) return;
+    void *fn = (void *)(kPreferredBase + kDeliverTouchFileOff + (uintptr_t)gSlide);
+    MSHookFunction(fn, (void *)hooked_deliver_touch, (void **)&orig_deliver_touch);
+    gDeliverTouchHookInstalled = YES;
+    SSHHLog("deliver-touch hook installed fn=%p off=0x%lx", fn, (unsigned long)kDeliverTouchFileOff);
+}
+
 static void SSHHFixHUDWindows(const char *reason) {
     UIWindow *log = SSHHFindLogWindow();
-    Class hudCls = objc_getClass("HUDMainWindow");
-    UIWindow *hud = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (hudCls && [w isKindOfClass:hudCls]) { hud = w; break; }
-    }
+    UIWindow *hud = SSHHFindHUDWindow();
 
-    // 日志窗提到最高，绘制窗可显示但不可点
+    // 日志窗提到最高；绘制窗可显示但不可点
     if (log) {
-        // 原版 log=statusBar-1 / hud=statusBar+1，自定义 HID 又只测 firstObject，极易点穿
+        // 原版 log=statusBar-1 / hud=statusBar+1，自定义 HID 又只测 firstObject
         log.windowLevel = 10000001.0;
         log.hidden = NO;
+        log.alpha = 1.0;
         log.userInteractionEnabled = YES;
-        [log makeKeyAndVisible];
+        // 不频繁 makeKeyAndVisible，避免抢焦点；首次/显式修复时再 key
+        static BOOL sDidMakeKey = NO;
+        if (!sDidMakeKey || [@(reason) containsString:@"didFinish"] || [@(reason) containsString:@"ctor"]) {
+            [log makeKeyAndVisible];
+            sDidMakeKey = YES;
+        }
         if ([log.rootViewController isKindOfClass:objc_getClass("LogViewController")]) {
+            SSHHUnlockCloseButton((LogViewController *)log.rootViewController, reason);
+        } else if ([NSStringFromClass(log.rootViewController.class) isEqualToString:@"LogViewController"]) {
             SSHHUnlockCloseButton((LogViewController *)log.rootViewController, reason);
         }
     }
     if (hud) {
         hud.windowLevel = 10000000.0; // 仍可盖住游戏，但低于 log
         hud.userInteractionEnabled = NO;
-        hud.rootViewController.view.userInteractionEnabled = NO;
+        if (hud.rootViewController.view) {
+            hud.rootViewController.view.userInteractionEnabled = NO;
+        }
     }
 
-    SSHHForceHitTestWindow(reason);
-    SSHHLog("fix HUD windows reason=%s log=%p level=%.1f hud=%p",
-            reason, log, log.windowLevel, hud);
+    SSHHForceHitTestWindow(reason, YES);
+    SSHHLog("fix HUD windows reason=%s log=%p level=%.1f hud=%p hudLevel=%.1f",
+            reason, log, log ? log.windowLevel : -1.0, hud, hud ? hud.windowLevel : -1.0);
 }
 
 %hook HUDMainWindow
@@ -442,6 +547,9 @@ static void SSHHFixHUDWindows(const char *reason) {
 - (BOOL)userInteractionEnabled {
     return NO;
 }
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    %orig(NO);
+}
 %end
 
 %hook LOGRootWindow
@@ -451,16 +559,73 @@ static void SSHHFixHUDWindows(const char *reason) {
 - (BOOL)userInteractionEnabled {
     return YES;
 }
+- (void)setUserInteractionEnabled:(BOOL)enabled {
+    %orig(YES);
+}
 // 保证日志窗可点
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = %orig;
     if (!v) {
-        // 兜底：点在窗口内就返回 rootView
+        // 兜底：点在窗口内就尽量返回可交互子树
         if (CGRectContainsPoint(self.bounds, point)) {
-            return self.rootViewController.view ?: self;
+            UIView *root = self.rootViewController.view;
+            if (root) {
+                CGPoint rp = [self convertPoint:point toView:root];
+                UIView *inner = [root hitTest:rp withEvent:event];
+                if (inner) return inner;
+                return root;
+            }
+            return self;
         }
     }
     return v;
+}
+%end
+
+// 合成触摸入口再兜一层：即便全局窗口写错，也把 inWindow/onView 纠到 LOG
+%hook TSEventFetcher
+// 返回值在原二进制里是 BOOL 语义（非 id），这里用 BOOL 避免 ARC 误处理
++ (BOOL)receiveAXEventID:(unsigned int)eventID
+  atGlobalCoordinate:(CGPoint)point
+      withTouchPhase:(NSInteger)phase
+            inWindow:(UIWindow *)window
+              onView:(UIView *)view {
+    UIWindow *log = SSHHFindLogWindow();
+    if (log) {
+        // 窗口不对时重定向
+        BOOL windowBad = (!window) || (window != log) || [window isKindOfClass:objc_getClass("HUDMainWindow")];
+        if (windowBad) {
+            window = log;
+        }
+        // view 为空或属于 HUD 时，在 LOG 上重 hitTest
+        BOOL viewBad = (!view);
+        if (!viewBad && view.window && view.window != log) viewBad = YES;
+        if (!viewBad && [view.window isKindOfClass:objc_getClass("HUDMainWindow")]) viewBad = YES;
+        if (viewBad) {
+            CGPoint local = [log convertPoint:point fromWindow:nil];
+            // 全局坐标 -> 窗口坐标；若 fromWindow:nil 行为异常，再试 bounds 映射
+            UIView *hit = [log hitTest:local withEvent:nil];
+            if (!hit) {
+                // 有些机型 location 已是窗口坐标
+                hit = [log hitTest:point withEvent:nil];
+            }
+            if (!hit) {
+                hit = log.rootViewController.view ?: log;
+            }
+            view = hit;
+            static NSUInteger sRedirectCount = 0;
+            sRedirectCount++;
+            if (sRedirectCount <= 12 || (sRedirectCount % 180) == 0) {
+                SSHHLog("TSEventFetcher redirect #%lu phase=%ld win=%@ view=%@ pt=(%.1f,%.1f)",
+                        (unsigned long)sRedirectCount,
+                        (long)phase,
+                        NSStringFromClass(window.class),
+                        NSStringFromClass(view.class),
+                        point.x, point.y);
+            }
+        }
+    }
+    return %orig(eventID, point, phase, window, view);
 }
 %end
 
@@ -469,6 +634,8 @@ static void SSHHFixHUDWindows(const char *reason) {
     BOOL ret = %orig;
     SSHHLog("HUDDelegate didFinishLaunching");
     // 窗口刚建完立刻修层级/命中
+    SSHHInstallHitWindowHook();
+    SSHHInstallDeliverTouchHook();
     SSHHFixHUDWindows("didFinishLaunching");
     dispatch_async(dispatch_get_main_queue(), ^{ SSHHFixHUDWindows("didFinish.async"); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -478,7 +645,7 @@ static void SSHHFixHUDWindows(const char *reason) {
         SSHHFixHUDWindows("didFinish.1s");
     });
     // 利用过程中再刷几次，防止状态刷新把按钮打回 disabled
-    for (int i = 2; i <= 8; i++) {
+    for (int i = 2; i <= 10; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             SSHHFixHUDWindows("keepalive");
         });
@@ -496,8 +663,8 @@ static void SSHHFixHUDWindows(const char *reason) {
         NSArray *args = NSProcessInfo.processInfo.arguments ?: @[];
         BOOL isHUD = SSHHIsHUDProcess();
         BOOL isCalc = SSHHIsCalculatorHost();
-        SSHHLog("loaded bid=%@ exe=%@ args=%@ uid=%d euid=%d hud=%d",
-                bid, exe, args, (int)getuid(), (int)geteuid(), (int)isHUD);
+        SSHHLog("loaded bid=%@ exe=%@ args=%@ uid=%d euid=%d hud=%d calc=%d",
+                bid, exe, args, (int)getuid(), (int)geteuid(), (int)isHUD, (int)isCalc);
 
         if (isCalc && !isHUD) {
             // 主界面：激活绕过 + spawn 诊断
@@ -505,23 +672,31 @@ static void SSHHFixHUDWindows(const char *reason) {
             SSHHInstallPosixSpawnHook();
         }
 
-        if (isHUD || isCalc) {
+        if (isHUD) {
             // HUD 子进程：触摸/关闭修复
-            if (isHUD) {
+            // 1) once 写 firstObject 时覆盖
+            // 2) 每次 deliver touch 再强制覆盖（核心）
+            SSHHInstallHitWindowHook();
+            SSHHInstallDeliverTouchHook();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 SSHHInstallHitWindowHook();
-                // 延迟再装一次，防 image slide 尚未稳定
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    SSHHInstallHitWindowHook();
-                    SSHHFixHUDWindows("hud.ctor");
-                });
-            }
+                SSHHInstallDeliverTouchHook();
+                SSHHFixHUDWindows("hud.ctor.0.05s");
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                SSHHInstallDeliverTouchHook();
+                SSHHFixHUDWindows("hud.ctor.0.5s");
+            });
         }
 
-        SSHHLog("classes LogVC=%p HUDDelegate=%p LOGRoot=%p HUDMain=%p",
+        SSHHLog("classes LogVC=%p HUDDelegate=%p LOGRoot=%p HUDMain=%p TSEventFetcher=%p",
                 objc_getClass("LogViewController"),
                 objc_getClass("HUDDelegate"),
                 objc_getClass("LOGRootWindow"),
-                objc_getClass("HUDMainWindow"));
-        SSHHLog("init done v0.1.4");
+                objc_getClass("HUDMainWindow"),
+                objc_getClass("TSEventFetcher"));
+        SSHHLog("init done v0.1.5 deliverTouch=0x%lx hitWindowGlobal=0x%lx",
+                (unsigned long)kDeliverTouchFileOff,
+                (unsigned long)kHitWindowGlobalOff);
     }
 }

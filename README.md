@@ -14,6 +14,12 @@
 3. **日志窗关闭解锁**
    - 原版加载中 `canCloseLogPanel=NO`，X 点不动
    - 强制允许关闭，并恢复 closeButton enabled/alpha
+4. **HUD 触摸路由修复（0.1.5 强化）**
+   - 原版 `HIDDeliverTouchOnMain` 只对全局 hit 窗口做 hitTest
+   - 该全局 once 写成 `windows.firstObject`，常为不可点的 `HUDMainWindow`
+   - 现已在 **每次** deliver touch 强制写成 `LOGRootWindow`
+   - 额外 hook `TSEventFetcher` 做 inWindow/onView 重定向兜底
+   - 提升 `LOGRootWindow` 层级，`HUDMainWindow hitTest` 恒 nil
 
 ## 构建
 
@@ -25,6 +31,8 @@ make package
 ./build_roothide.sh
 ```
 
+GitHub Actions：push 到 `main` 会自动 roothide 编译，产物在 Actions artifact `roothide-packages`。
+
 ## 日志
 
 ```sh
@@ -33,22 +41,14 @@ log stream --predicate 'eventMessage CONTAINS "[sshh]"' --level debug
 
 点“开启绘制”后重点看：
 
-- `startButtonTapped`
-- `HUDThread StartAndEnd:1`
-- `posix_spawn ENTER/OK/FAIL`
-- `HUD post-start check pidExists=...`
+- `loaded ... hud=1`
+- `deliver-touch hook installed`
+- `hit window forced LOG`
+- `deliver_touch #N forced=1 before=... after=LOGRootWindow`
+- `closeTapped`（点 X 时应出现）
 
+## 版本
 
-## 0.1.3 HUD 触摸修复
-
-现象：日志窗看得见但点不了/滑不动。
-
-原因：
-1. 加载中 `canCloseLogPanel=NO`，X 被禁用
-2. 自定义 HID 只 `hitTest(windows.firstObject)`，firstObject 常是不可交互的 `HUDMainWindow`
-
-修复：
-- 强制关闭解锁
-- 提升 `LOGRootWindow` 层级
-- `HUDMainWindow hitTest` 恒返回 nil
-- 强制 HID 命中窗口为 `LOGRootWindow`
+- `0.1.3` 初次 HUD 触摸修复（只 hook set_hit_window + 关锁）
+- `0.1.4` ARC 编译修复
+- `0.1.5` 每次 `HIDDeliverTouchOnMain` 强制 LOG 窗 + TSEventFetcher 重定向
