@@ -4,3 +4,5 @@ packages/
 *.dylib
 *.o
 .DS_Store
+build/
+obj/

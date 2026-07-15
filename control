@@ -1,9 +1,9 @@
 Package: com.susu.sshh
 Name: sshh
-Version: 0.0.1
-Architecture: iphoneos-arm
-Description: Runtime helper for Calculator welcome flow in roothide environments.
+Version: 0.1.0
+Architecture: iphoneos-arm64e
+Description: Runtime activation bypass for original Calculator/ZeroCore PersistenceHelper. Forces welcome flow into home without patching the main binary.
 Maintainer: SuSu
 Author: SuSu
 Section: Tweaks
-Depends: mobilesubstrate
+Depends: mobilesubstrate (>= 0.9.5000) | org.coolstar.libhooker | libellekit
