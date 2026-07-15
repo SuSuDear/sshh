@@ -11,6 +11,9 @@
    - Hook `-[ViewController startButtonTapped]`
    - Hook `+[HUDThread StartAndEnd:]` / `CheckHudThreadState:`
    - Hook `posix_spawn` 打印 path/argv/返回值
+3. **日志窗关闭解锁**
+   - 原版加载中 `canCloseLogPanel=NO`，X 点不动
+   - 强制允许关闭，并恢复 closeButton enabled/alpha
 
 ## 构建
 

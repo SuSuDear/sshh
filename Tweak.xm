@@ -55,6 +55,16 @@ static const uintptr_t kPreferredBase         = 0x100000000ULL;
 - (BOOL)GetRunning:(id)arg;
 @end
 
+@interface LogViewController : UIViewController
+- (BOOL)canCloseLogPanel;
+- (void)setCanCloseLogPanel:(BOOL)value;
+- (UIButton *)closeButton;
+- (UILabel *)titleLabel;
+- (void)closeTapped;
+- (void)hideLogMenuAnimated:(BOOL)animated;
+- (void)setLogSystemActive:(BOOL)active;
+@end
+
 #pragma mark - 底层激活检查 hook
 
 typedef int (*ZCCheckFn)(void);
@@ -287,6 +297,97 @@ static void SSHHForceEnterHome(TSHWelcomeViewController *self, const char *reaso
 
 %end
 
+
+#pragma mark - 日志窗关闭解锁
+
+// 原版：加载中 canCloseLogPanel=NO，closeTapped 直接 return
+// 现象：标题“等待加载完成后再关闭日志”，X 半透明且点不动
+// 处理：强制允许关闭，并恢复按钮可点状态
+static void SSHHUnlockCloseButton(LogViewController *self, const char *reason) {
+    if (!self) return;
+
+    if ([self respondsToSelector:@selector(setCanCloseLogPanel:)]) {
+        [self setCanCloseLogPanel:YES];
+    }
+
+    UIButton *btn = nil;
+    if ([self respondsToSelector:@selector(closeButton)]) {
+        btn = [self closeButton];
+    }
+    if ([btn isKindOfClass:[UIButton class]]) {
+        btn.enabled = YES;
+        btn.userInteractionEnabled = YES;
+        btn.alpha = 1.0;
+    }
+
+    if ([self respondsToSelector:@selector(titleLabel)]) {
+        UILabel *title = [self titleLabel];
+        if ([title isKindOfClass:[UILabel class]]) {
+            // 不覆盖“加载成功/失败”最终态，只在等待态改文案
+            NSString *cur = title.text ?: @"";
+            if ([cur containsString:@"等待"] || [cur containsString:@"关闭日志"] || cur.length == 0) {
+                title.text = @"日志（可随时关闭）";
+            }
+        }
+    }
+
+    SSHHLog("unlock close button reason=%s btn=%p enabled=%d alpha=%.2f",
+            reason, btn, (int)btn.enabled, btn ? btn.alpha : -1.0);
+}
+
+%hook LogViewController
+
+// 始终允许 closeTapped 通过
+- (BOOL)canCloseLogPanel {
+    BOOL orig = %orig;
+    if (!orig) {
+        SSHHLog("canCloseLogPanel forced YES (orig=NO)");
+    }
+    return YES;
+}
+
+- (void)setCanCloseLogPanel:(BOOL)value {
+    // 原版可能反复设回 NO；统一抬到 YES
+    SSHHLog("setCanCloseLogPanel:%d -> YES", (int)value);
+    %orig(YES);
+}
+
+- (void)viewDidLoad {
+    %orig;
+    SSHHLog("LogViewController viewDidLoad");
+    SSHHUnlockCloseButton(self, "viewDidLoad");
+
+    __weak LogViewController *weakSelf = self;
+    // UI 异步布局后 dual-unlock，避免 setupUI 后半段又 setEnabled:NO
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SSHHUnlockCloseButton(weakSelf, "viewDidLoad.async");
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SSHHUnlockCloseButton(weakSelf, "viewDidLoad.0.5s");
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SSHHUnlockCloseButton(weakSelf, "viewDidLoad.1.5s");
+    });
+}
+
+// 日志刷新时原版可能再次禁用关闭；这里每次状态更新后解锁
+- (void)updateStatusForLogLine:(id)line {
+    %orig;
+    SSHHUnlockCloseButton(self, "updateStatusForLogLine");
+}
+
+- (void)closeTapped {
+    SSHHLog("closeTapped hit canClose=%d",
+            (int)([self respondsToSelector:@selector(canCloseLogPanel)] ? [self canCloseLogPanel] : -1));
+    // 再保险：点之前强制解锁
+    SSHHUnlockCloseButton(self, "closeTapped");
+    %orig;
+}
+
+%end
+
 #pragma mark - ctor
 
 %ctor {
@@ -319,7 +420,8 @@ static void SSHHForceEnterHome(TSHWelcomeViewController *self, const char *reaso
         Class welcomeCls = objc_getClass("TSHWelcomeViewController");
         Class hudThreadCls = objc_getClass("HUDThread");
         Class vcCls = objc_getClass("ViewController");
-        SSHHLog("classes welcome=%p HUDThread=%p ViewController=%p", welcomeCls, hudThreadCls, vcCls);
+        Class logVCCls = objc_getClass("LogViewController");
+        SSHHLog("classes welcome=%p HUDThread=%p ViewController=%p LogViewController=%p", welcomeCls, hudThreadCls, vcCls, logVCCls);
         SSHHLog("init done");
     }
 }
