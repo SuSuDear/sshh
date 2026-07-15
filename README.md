@@ -2,53 +2,38 @@
 
 原版 Calculator / ZeroCore PersistenceHelper 运行时辅助。
 
-## 功能
+## 0.1.6 触摸修复（收敛）
 
-1. **激活绕过**
-   - Hook 欢迎页 `tsh_checkActivationAndEnterHome` 直接 `ToHome:`
-   - Hook 底层校验 `0x8C904` / `0x8C7A8` 返回 1
-2. **绘制启动诊断**
-   - Hook `-[ViewController startButtonTapped]`
-   - Hook `+[HUDThread StartAndEnd:]` / `CheckHudThreadState:`
-   - Hook `posix_spawn` 打印 path/argv/返回值
-3. **日志窗关闭解锁**
-   - 原版加载中 `canCloseLogPanel=NO`，X 点不动
-   - 强制允许关闭，并恢复 closeButton enabled/alpha
-4. **HUD 触摸路由修复（0.1.5 强化）**
-   - 原版 `HIDDeliverTouchOnMain` 只对全局 hit 窗口做 hitTest
-   - 该全局 once 写成 `windows.firstObject`，常为不可点的 `HUDMainWindow`
-   - 现已在 **每次** deliver touch 强制写成 `LOGRootWindow`
-   - 额外 hook `TSEventFetcher` 做 inWindow/onView 重定向兜底
-   - 提升 `LOGRootWindow` 层级，`HUDMainWindow hitTest` 恒 nil
+截图已证明插件生效，且原版在“漏洞加载完成”后会自己解锁关闭。
+因此“点不了”不是 close 锁问题。
 
-## 构建
+0.1.5 过激改动可能反而破坏触摸：
+- 把 `windowLevel` 拉到 1e7，却不重新 `registerWindowWithContextID:atLevel:`
+- `TSEventFetcher` 参数重写有风险
+- `hitTest` 强行返回 rootView 可能打断 UIControl
 
-```sh
-cd /path/to/sshh
-source ./devkit/roothide.sh
-make package
-# 或
-./build_roothide.sh
-```
+0.1.6：
+- **不再改 windowLevel**
+- 每次 `HIDDeliverTouchOnMain` 仍强制全局 hit 窗 = `LOGRootWindow`
+- 修复 `HideView/secureHostView` 内部可点层级
+- 重新 accessibility 登记（保持原 level）
+- 文件日志：`/var/mobile/Library/Caches/sshh-touch.log`
 
-GitHub Actions：push 到 `main` 会自动 roothide 编译，产物在 Actions artifact `roothide-packages`。
+## 装完后请做
 
-## 日志
+1. 重新开启绘制
+2. 点几下日志窗
+3. 把下面文件发我：
 
 ```sh
-log stream --predicate 'eventMessage CONTAINS "[sshh]"' --level debug
+cat /var/mobile/Library/Caches/sshh-touch.log
 ```
 
-点“开启绘制”后重点看：
-
-- `loaded ... hud=1`
+关键行：
+- `loaded ... hud=1 v=0.1.6`
 - `deliver-touch hook installed`
-- `hit window forced LOG`
-- `deliver_touch #N forced=1 before=... after=LOGRootWindow`
-- `closeTapped`（点 X 时应出现）
+- `deliver_touch #N ... hit=...`
+- `HUDApplication sendEvent`
+- `closeTapped ENTER`
 
-## 版本
-
-- `0.1.3` 初次 HUD 触摸修复（只 hook set_hit_window + 关锁）
-- `0.1.4` ARC 编译修复
-- `0.1.5` 每次 `HIDDeliverTouchOnMain` 强制 LOG 窗 + TSEventFetcher 重定向
+如果完全没有 `deliver_touch` / `sendEvent`，说明 HID 合成链没进进程，问题在更底层（权限/backboard），不是按钮逻辑。
