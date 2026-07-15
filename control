@@ -1,6 +1,6 @@
 Package: com.susu.sshh
 Name: sshh
-Version: 0.1.0
+Version: 0.1.1
 Architecture: iphoneos-arm64e
 Description: Runtime activation bypass for original Calculator/ZeroCore PersistenceHelper. Forces welcome flow into home without patching the main binary.
 Maintainer: SuSu
