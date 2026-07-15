@@ -6,6 +6,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
@@ -368,14 +369,20 @@ static void SSHHForceHitTestWindow(const char *reason) {
         SSHHLog("force hit window: log not found (%s)", reason);
         return;
     }
-    id *slot = (id *)(kPreferredBase + kHitWindowGlobalOff + (uintptr_t)gSlide);
-    id old = *slot;
-    if (old == (id)log) {
+    // 原二进制全局 slot 存 strong UIWindow*。
+    // ARC 禁止把整数地址直接转成 id*，也不能裸用 objc_retain/objc_release。
+    // 用 void** + CFRetain/CFRelease 写全局，语义等价于强引用替换。
+    void **slot = (void **)(uintptr_t)(kPreferredBase + kHitWindowGlobalOff + (uintptr_t)gSlide);
+    void *old = *slot;
+    if (old == (__bridge void *)log) {
         SSHHLog("hit window already LOG (%s) %p", reason, log);
         return;
     }
-    *slot = (id)objc_retain(log);
-    if (old) objc_release(old);
+    CFRetain((__bridge CFTypeRef)log);
+    *slot = (__bridge void *)log;
+    if (old) {
+        CFRelease((CFTypeRef)old);
+    }
     SSHHLog("hit window forced LOG (%s) %p old=%p", reason, log, old);
 }
 
@@ -515,6 +522,6 @@ static void SSHHFixHUDWindows(const char *reason) {
                 objc_getClass("HUDDelegate"),
                 objc_getClass("LOGRootWindow"),
                 objc_getClass("HUDMainWindow"));
-        SSHHLog("init done v0.1.3");
+        SSHHLog("init done v0.1.4");
     }
 }
